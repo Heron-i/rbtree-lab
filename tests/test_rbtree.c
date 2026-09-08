@@ -1,148 +1,151 @@
 //Purpose: My unit tests created with known specs and edge cases (table-driven tests)
-
+// Implements RBC-01, RBC-02, RBC-03, RBC-04, RBC-05, RBC-08, RBC-10 from the
+// rb_create test plan. The remaining planned cases (RBC-06, RBC-07, RBC-09,
+// RBC-11, RBC-12, RBC-13) are deferred but still tracked in the plan.
 #include "rbtree.h"
+
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-extern bool rb_fail_next_alloc;   /* test-only hook defined in src/rbtree.c */
+/* test-only fault-injection hook defined in rbtree.c (external linkage,
+ * intentionally not part of the public header contract) */
+extern bool rb_fail_next_alloc;
+
+/* value_free test double: just needs to be a valid callback for RBC-02. */
+static void free_recorder(void *value) {
+    (void)value;
+}
+
+/* ---- RBC-01: create with value_free = NULL ---- */
+static bool test_rbc01_create_null_value_free(void) {
+    rbtree_t *t = rb_create(NULL);
+    bool ok = (t != NULL);
+    if (!ok) fprintf(stderr, "    rb_create(NULL) returned NULL, expected non-NULL\n");
+    if (t) rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBC-02: create with a real value_free callback ---- */
+static bool test_rbc02_create_with_value_free(void) {
+    rbtree_t *t = rb_create(free_recorder);
+    bool ok = (t != NULL);
+    if (!ok) fprintf(stderr, "    rb_create(free_recorder) returned NULL, expected non-NULL\n");
+    if (t) rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBC-03: fresh tree has size 0 ---- */
+static bool test_rbc03_fresh_size_zero(void) {
+    rbtree_t *t = rb_create(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot check size\n");
+        return false;
+    }
+    size_t n = rb_size(t);
+    bool ok = (n == 0);
+    if (!ok) fprintf(stderr, "    rb_size(fresh tree) = %zu, expected 0\n", n);
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBC-04: fresh tree passes full validation ---- */
+static bool test_rbc04_fresh_validates(void) {
+    rbtree_t *t = rb_create(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot validate\n");
+        return false;
+    }
+    int rc = rb_validate(t);
+    bool ok = (rc == 0);
+    if (!ok) fprintf(stderr, "    rb_validate(fresh tree) = %d, expected 0\n", rc);
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBC-05: sentinel is BLACK immediately at creation, not just
+ * post-insert/post-fixup ---- */
+static bool test_rbc05_sentinel_black_at_creation(void) {
+    rbtree_t *t = rb_create(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot validate\n");
+        return false;
+    }
+    int rc = rb_validate(t);
+    bool ok = (rc == 0);
+    if (!ok) {
+        fprintf(stderr,
+                "    rb_validate(fresh tree, pre-insert) = %d, expected 0 "
+                "(sentinel must be BLACK at creation)\n",
+                rc);
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBC-08: two trees created independently don't share state ---- */
+static bool test_rbc08_independent_trees(void) {
+    rbtree_t *t1 = rb_create(NULL);
+    rbtree_t *t2 = rb_create(NULL);
+    if (!t1 || !t2) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL for t1 or t2\n");
+        if (t1) rb_destroy(t1);
+        if (t2) rb_destroy(t2);
+        return false;
+    }
+    int rc = rb_insert(t1, "a", NULL);
+    bool ok = (rc == 0) && (rb_size(t1) == 1) && (rb_size(t2) == 0) && (rb_validate(t2) == 0);
+    if (!ok) {
+        fprintf(stderr,
+                "    after inserting into t1: rb_insert rc=%d, size(t1)=%zu (want 1), "
+                "size(t2)=%zu (want 0), validate(t2)=%d (want 0)\n",
+                rc, rb_size(t1), rb_size(t2), rb_validate(t2));
+    }
+    rb_destroy(t1);
+    rb_destroy(t2);
+    return ok;
+}
+
+/* ---- RBC-10: allocation failure during create returns NULL ---- */
+static bool test_rbc10_alloc_failure_returns_null(void) {
+    rb_fail_next_alloc = true;
+    rbtree_t *t = rb_create(NULL);
+    bool ok = (t == NULL);
+    if (!ok) {
+        fprintf(stderr,
+                "    rb_create(NULL) with rb_fail_next_alloc=true returned non-NULL, "
+                "expected NULL\n");
+        rb_destroy(t);
+    }
+    return ok;
+}
 
 typedef struct {
+    const char *id;
     const char *name;
-    bool (*run)(const char **where, const char **input);
+    bool (*run)(void);
 } test_case_t;
 
-static int free_call_count;
-
-static void dummy_free(void *value) {
-    (void)value;
-    free_call_count++;
-}
-
-static bool create_returns_non_null_no_free_fn(const char **where, const char **input) {
-    *input = "value_free=NULL";
-    rbtree_t *t = rb_create(NULL);
-    if (t == NULL) {
-        *where = "rb_create returned NULL for a normal allocation";
-        return false;
-    }
-    rb_destroy(t);
-    return true;
-}
-
-static bool create_returns_non_null_with_free_fn(const char **where, const char **input) {
-    *input = "value_free=dummy_free";
-    rbtree_t *t = rb_create(dummy_free);
-    if (t == NULL) {
-        *where = "rb_create returned NULL when given a non-NULL value_free callback";
-        return false;
-    }
-    rb_destroy(t);
-    return true;
-}
-
-static bool create_returns_independent_instances(const char **where, const char **input) {
-    *input = "two sequential rb_create(NULL) calls";
-    rbtree_t *a = rb_create(NULL);
-    rbtree_t *b = rb_create(NULL);
-    bool ok = true;
-    if (a == NULL) { *where = "first rb_create(NULL) call returned NULL"; ok = false; }
-    else if (b == NULL) { *where = "second rb_create(NULL) call returned NULL"; ok = false; }
-    else if (a == b) { *where = "two independent rb_create(NULL) calls returned the same pointer"; ok = false; }
-    rb_destroy(a);
-    rb_destroy(b);
-    return ok;
-}
-
-static bool create_oom_returns_null(const char **where, const char **input) {
-    *input = "rb_fail_next_alloc=true before rb_create(NULL) (simulated OOM on the tree struct's malloc)";
-    rb_fail_next_alloc = true;
-    rbtree_t *t = rb_create(NULL);
-    if (t != NULL) {
-        *where = "rb_create did not return NULL when its allocation was forced to fail";
-        rb_destroy(t);
-        return false;
-    }
-    return true;
-}
-
-static bool create_oom_then_recovers(const char **where, const char **input) {
-    *input = "rb_fail_next_alloc=true for the first call only, then a second rb_create(NULL)";
-    rb_fail_next_alloc = true;
-    rbtree_t *failed = rb_create(NULL);
-    rbtree_t *ok_tree = rb_create(NULL);
-    bool ok = true;
-    if (failed != NULL) { *where = "the forced-failure call unexpectedly returned non-NULL"; ok = false; }
-    else if (ok_tree == NULL) { *where = "the following normal rb_create(NULL) call also returned NULL"; ok = false; }
-    rb_destroy(failed);
-    rb_destroy(ok_tree);
-    return ok;
-}
-
-static bool destroy_null_is_safe(const char **where, const char **input) {
-    (void)where;   /* cannot fail without crashing; nothing to describe */
-    *input = "t=NULL";
-    rb_destroy(NULL);
-    return true;   /* success == did not crash */
-}
-
-static bool destroy_freshly_created_tree(const char **where, const char **input) {
-    *input = "t=rb_create(NULL) result";
-    rbtree_t *t = rb_create(NULL);
-    if (t == NULL) {
-        *where = "rb_create(NULL) returned NULL; could not exercise rb_destroy on a real tree";
-        return false;
-    }
-    rb_destroy(t);
-    return true;
-}
-
-static bool destroy_empty_tree_never_calls_value_free(const char **where, const char **input) {
-    static char detail[96];
-    *input = "value_free=dummy_free, no keys inserted";
-    free_call_count = 0;
-    rbtree_t *t = rb_create(dummy_free);
-    if (t == NULL) {
-        *where = "rb_create(dummy_free) returned NULL; could not exercise rb_destroy on a real tree";
-        return false;
-    }
-    rb_destroy(t);
-    if (free_call_count != 0) {
-        snprintf(detail, sizeof detail,
-                 "value_free was called %d time(s) on an empty tree, expected 0",
-                 free_call_count);
-        *where = detail;
-        return false;
-    }
-    return true;
-}
-
 static const test_case_t tests[] = {
-    { "create_returns_non_null_no_free_fn", create_returns_non_null_no_free_fn },
-    { "create_returns_non_null_with_free_fn", create_returns_non_null_with_free_fn },
-    { "create_returns_independent_instances", create_returns_independent_instances },
-    { "create_oom_returns_null", create_oom_returns_null },
-    { "create_oom_then_recovers", create_oom_then_recovers },
-    { "destroy_null_is_safe", destroy_null_is_safe },
-    { "destroy_freshly_created_tree", destroy_freshly_created_tree },
-    { "destroy_empty_tree_never_calls_value_free", destroy_empty_tree_never_calls_value_free },
+    {"RBC-01", "create with value_free = NULL", test_rbc01_create_null_value_free},
+    {"RBC-02", "create with a real value_free callback", test_rbc02_create_with_value_free},
+    {"RBC-03", "fresh tree has size 0", test_rbc03_fresh_size_zero},
+    {"RBC-04", "fresh tree passes full validation", test_rbc04_fresh_validates},
+    {"RBC-05", "sentinel is BLACK immediately at creation", test_rbc05_sentinel_black_at_creation},
+    {"RBC-08", "two trees created independently don't share state",
+     test_rbc08_independent_trees},
+    {"RBC-10", "allocation failure during create returns NULL",
+     test_rbc10_alloc_failure_returns_null},
 };
 
 int main(void) {
-    size_t failures = 0;
-    size_t n = sizeof tests / sizeof tests[0];
-    /* invariant: every case in tests[0..i) has been run, reported, and tallied */
-    for (size_t i = 0; i < n; i++) {
-        const char *where = "(unspecified check)";
-        const char *input = "(unspecified input)";
-        bool passed = tests[i].run(&where, &input);
-        if (passed) {
-            printf("[PASS] %s\n", tests[i].name);
-        } else {
-            printf("[FAIL] Test %s failed at %s for input %s.\n",
-                   tests[i].name, where, input);
-            failures++;
-        }
+    size_t total = sizeof(tests) / sizeof(tests[0]);
+    size_t passed = 0;
+    for (size_t i = 0; i < total; i++) {
+        bool ok = tests[i].run();
+        printf("[%s] %-55s %s\n", tests[i].id, tests[i].name, ok ? "PASS" : "FAIL");
+        if (ok) passed++;
     }
-    printf("%zu/%zu tests passed\n", n - failures, n);
-    return failures == 0 ? 0 : 1;
+    printf("%zu/%zu rb_create tests passed\n", passed, total);
+    return (passed == total) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

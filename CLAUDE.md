@@ -2,13 +2,6 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project state
-
-This is a CS370 lab assignment scaffold for implementing a red-black tree in C. As of now the
-repository contains only stub files — the Makefile, header, and all source/test files are empty
-except for a one-line purpose comment at the top of each. There is no build system, no test
-runner, and no git repository initialized yet. Treat any "commands" below as things to build,
-not things that already work.
 
 # rbtree-lab: project rules
   ## Commands
@@ -32,6 +25,7 @@ not things that already work.
   ## Workflow
   - For any multi-file or algorithmic change: propose a plan and wait for
   approval before editing.
+  - build tests first always, then implementation.
   - Commit only from a green state; message format "M<n>: <what>".
   
 
