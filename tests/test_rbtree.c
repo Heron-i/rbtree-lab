@@ -11,11 +11,19 @@
 // what's observable in-process (crash-freedom, value_free call
 // count/values); leak/double-free correctness (e.g. "every node freed
 // together with its key copy") is verified separately by `make memcheck`.
+// Implements RBV-01..RBV-10 from the rb_validate test plan (root-black,
+// no-red-red, black-height, in-order/BST ordering, size-matches-count --
+// each with a valid and an invalid tree). The invalid-tree cases are
+// white-box: they build a valid tree via the public API, then mutate one
+// field through rbtree_internal.h to force a single targeted invariant
+// violation.
 #include "rbtree.h"
+#include "../src/rbtree_internal.h"
 
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* test-only fault-injection hook defined in rbtree.c (external linkage,
  * intentionally not part of the public header contract) */
@@ -159,7 +167,7 @@ static bool test_rbd01_delete_red_leaf(void) {
         fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
         return false;
     }
-    const char *keys[] = {"10", "5", "15", "3"};
+    const char *keys[] = {"10", "05", "15", "03"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (rb_insert(t, keys[i], NULL) != 0) {
             fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
@@ -167,14 +175,16 @@ static bool test_rbd01_delete_red_leaf(void) {
             return false;
         }
     }
-    /* "3" is a red leaf after inserting 10,5,15,3 (standard RB insert-fixup) */
-    int rc = rb_delete(t, "3");
+    /* "03" is a red leaf after inserting 10,05,15,03 (standard RB
+     * insert-fixup; keys are zero-padded to 2 digits so strcmp order
+     * matches numeric order -- see the note above build_baseline_tree) */
+    int rc = rb_delete(t, "03");
     int vrc = rb_validate(t);
     size_t n = rb_size(t);
     bool ok = (rc == 0) && (vrc == 0) && (n == 3);
     if (!ok) {
         fprintf(stderr,
-                "    delete(\"3\"): rb_delete rc=%d (want 0), rb_validate=%d (want 0), "
+                "    delete(\"03\"): rb_delete rc=%d (want 0), rb_validate=%d (want 0), "
                 "rb_size=%zu (want 3)\n",
                 rc, vrc, n);
     }
@@ -228,7 +238,7 @@ static bool test_rbd03_delete_two_children(void) {
         fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
         return false;
     }
-    const char *keys[] = {"10", "5", "15", "3", "7"};
+    const char *keys[] = {"10", "05", "15", "03", "07"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (rb_insert(t, keys[i], NULL) != 0) {
             fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
@@ -236,14 +246,14 @@ static bool test_rbd03_delete_two_children(void) {
             return false;
         }
     }
-    /* "5" has two real children ("3" and "7") after this sequence */
-    int rc = rb_delete(t, "5");
+    /* "05" has two real children ("03" and "07") after this sequence */
+    int rc = rb_delete(t, "05");
     int vrc = rb_validate(t);
     size_t n = rb_size(t);
     bool ok = (rc == 0) && (vrc == 0) && (n == 4);
     if (!ok) {
         fprintf(stderr,
-                "    delete(\"5\"): rb_delete rc=%d (want 0), rb_validate=%d (want 0), "
+                "    delete(\"05\"): rb_delete rc=%d (want 0), rb_validate=%d (want 0), "
                 "rb_size=%zu (want 4)\n",
                 rc, vrc, n);
     }
@@ -304,7 +314,7 @@ static bool test_rbx03_destroy_populated_tree(void) {
         fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
         return false;
     }
-    const char *keys[] = {"10", "5", "15", "3", "7"};
+    const char *keys[] = {"10", "05", "15", "03", "07"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (rb_insert(t, keys[i], NULL) != 0) {
             fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
@@ -386,7 +396,7 @@ static bool test_rbx06_destroy_after_mixed_history(void) {
         fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
         return false;
     }
-    const char *keys[] = {"10", "5", "15", "3", "7"};
+    const char *keys[] = {"10", "05", "15", "03", "07"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (rb_insert(t, keys[i], NULL) != 0) {
             fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
@@ -394,7 +404,7 @@ static bool test_rbx06_destroy_after_mixed_history(void) {
             return false;
         }
     }
-    if (rb_delete(t, "3") != 0 || rb_delete(t, "15") != 0) {
+    if (rb_delete(t, "03") != 0 || rb_delete(t, "15") != 0) {
         fprintf(stderr, "    rb_delete failed while thinning the tree before destroy\n");
         rb_destroy(t);
         return false;
@@ -407,6 +417,205 @@ static bool test_rbx06_destroy_after_mixed_history(void) {
                 "    before final destroy: rb_validate=%d (want 0), rb_size=%zu (want 3)\n",
                 vrc, n);
     }
+    rb_destroy(t);
+    return ok;
+}
+
+/* All numeric-looking keys in this file are zero-padded to 2 digits
+ * ("03" not "3"). Ordering here is via strcmp (lexicographic), not
+ * numeric, and unpadded mixed-width numbers sort unintuitively under
+ * strcmp ("3" > "10", since '3' > '1') -- zero-padding to a fixed width
+ * makes strcmp order match numeric order again, so the hand-traced shapes
+ * below hold. If a key >= 100 is ever needed, widen the padding to 3
+ * digits and repad every existing key to match, or this bug resurfaces. */
+
+/* shared baseline tree for most RBV-xx cases: 10B root, left 05B (children
+ * 03R,07R), right 15B leaf -- black-height 2 on every path, size 5 */
+static rbtree_t *build_baseline_tree(void) {
+    rbtree_t *t = rb_create(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
+        return NULL;
+    }
+    const char *keys[] = {"10", "05", "15", "03", "07"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (rb_insert(t, keys[i], NULL) != 0) {
+            fprintf(stderr, "    rb_insert(\"%s\") failed while building the baseline tree\n",
+                    keys[i]);
+            rb_destroy(t);
+            return NULL;
+        }
+    }
+    return t;
+}
+
+/* ---- RBV-01: root is black (valid) ---- */
+static bool test_rbv01_root_is_black_valid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    int vrc = rb_validate(t);
+    bool ok = (vrc == 0) && (t->root->color == BLACK);
+    if (!ok) {
+        fprintf(stderr,
+                "    baseline tree: rb_validate=%d (want 0), root color=%d (want BLACK=%d)\n",
+                vrc, t->root->color, BLACK);
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBV-02: root is black, violated (invalid) ---- */
+static bool test_rbv02_root_is_black_invalid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    t->root->color = RED;   /* force violation: root must always be BLACK */
+    int vrc = rb_validate(t);
+    bool ok = (vrc != 0);
+    if (!ok) fprintf(stderr, "    root forced RED: rb_validate=%d (want nonzero)\n", vrc);
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBV-03: no red node has a red child (valid) ---- */
+static bool test_rbv03_no_red_red_valid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    int vrc = rb_validate(t);
+    bool ok = (vrc == 0);
+    if (!ok) fprintf(stderr, "    baseline tree: rb_validate=%d (want 0)\n", vrc);
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBV-04: red-red violation (invalid) ----
+ * Flips node "05" (black, parent of red leaves "03","07") to red, creating
+ * red-red on both "05"-"03" and "05"-"07". This also drops black-height on
+ * those two paths relative to the "15" path -- acceptable, rb_validate
+ * only needs to report "invalid" (nonzero), not which single rule broke. */
+static bool test_rbv04_red_red_invalid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    t->root->left->color = RED;   /* node "05": BLACK -> RED */
+    int vrc = rb_validate(t);
+    bool ok = (vrc != 0);
+    if (!ok) fprintf(stderr, "    node \"05\" forced RED: rb_validate=%d (want nonzero)\n", vrc);
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBV-05: equal black-height on every root-to-NIL path (valid) ----
+ * Baseline tree: root->left("05")->left("03")->nil and
+ * root->left("05")->right("07")->nil each have black-height 2 (05B+nil);
+ * root->right("15")->nil also has black-height 2 (15B+nil). */
+static bool test_rbv05_black_height_valid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    int vrc = rb_validate(t);
+    bool ok = (vrc == 0);
+    if (!ok) fprintf(stderr, "    baseline tree: rb_validate=%d (want 0)\n", vrc);
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBV-06: black-height mismatch, isolated (invalid) ----
+ * Flips node "15" (a black leaf, parent is the black root) to red. It has
+ * no children, so this creates no red-red violation -- it purely drops the
+ * right-side path's black-height from 2 to 1 while the left side stays 2. */
+static bool test_rbv06_black_height_invalid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    t->root->right->color = RED;   /* node "15": BLACK -> RED */
+    int vrc = rb_validate(t);
+    bool ok = (vrc != 0);
+    if (!ok) fprintf(stderr, "    node \"15\" forced RED: rb_validate=%d (want nonzero)\n", vrc);
+    rb_destroy(t);
+    return ok;
+}
+
+#define TRAVERSAL_CAP 8
+struct traversal_ctx {
+    const char *keys[TRAVERSAL_CAP];
+    int count;
+};
+
+static void collect_key(const char *key, void *value, void *ctx) {
+    (void)value;
+    struct traversal_ctx *tc = ctx;
+    if (tc->count < TRAVERSAL_CAP) {
+        tc->keys[tc->count] = key;
+    }
+    tc->count++;
+}
+
+/* ---- RBV-07: in-order traversal yields strictly increasing keys (valid) ---- */
+static bool test_rbv07_inorder_increasing_valid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    struct traversal_ctx tc = {0};
+    rb_foreach(t, collect_key, &tc);
+    bool ok = (tc.count == 5);
+    for (int i = 0; ok && i + 1 < tc.count; i++) {
+        if (strcmp(tc.keys[i], tc.keys[i + 1]) >= 0) ok = false;
+    }
+    int vrc = rb_validate(t);
+    ok = ok && (vrc == 0);
+    if (!ok) {
+        fprintf(stderr,
+                "    in-order traversal not strictly increasing or count/validate wrong "
+                "(count=%d, want 5; rb_validate=%d, want 0)\n",
+                tc.count, vrc);
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBV-08: BST order violation (invalid) ----
+ * Swaps the key POINTERS (not contents) of nodes "05" and "03" -- a pure
+ * pointer swap, not a copy/free, so both heap key allocations still have
+ * exactly one live owner afterward (just held by the other node); the
+ * later rb_destroy still frees each exactly once. Structure/colors are
+ * untouched, but the left subtree's in-order sequence becomes
+ * "05","03","07", which is not strictly increasing. */
+static bool test_rbv08_bst_order_invalid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    struct rb_node *a = t->root->left;        /* "05" */
+    struct rb_node *b = t->root->left->left;  /* "03" */
+    char *tmp = a->key;
+    a->key = b->key;
+    b->key = tmp;
+    int vrc = rb_validate(t);
+    bool ok = (vrc != 0);
+    if (!ok) {
+        fprintf(stderr, "    keys of \"05\"/\"03\" swapped: rb_validate=%d (want nonzero)\n", vrc);
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBV-09: rb_size matches actual node count (valid) ---- */
+static bool test_rbv09_size_matches_count_valid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    size_t n = rb_size(t);
+    int vrc = rb_validate(t);
+    bool ok = (n == 5) && (vrc == 0);
+    if (!ok) {
+        fprintf(stderr, "    baseline tree: rb_size=%zu (want 5), rb_validate=%d (want 0)\n", n,
+                vrc);
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBV-10: size/count mismatch (invalid) ---- */
+static bool test_rbv10_size_mismatch_invalid(void) {
+    rbtree_t *t = build_baseline_tree();
+    if (!t) return false;
+    t->size += 1;   /* no structural change at all -- purely a bookkeeping drift */
+    int vrc = rb_validate(t);
+    bool ok = (vrc != 0);
+    if (!ok) fprintf(stderr, "    size bumped by 1: rb_validate=%d (want nonzero)\n", vrc);
     rb_destroy(t);
     return ok;
 }
@@ -439,6 +648,18 @@ static const test_case_t tests[] = {
      test_rbx05_no_value_free_when_null},
     {"RBX-06", "destroy after mixed insert/delete history runs cleanly",
      test_rbx06_destroy_after_mixed_history},
+    {"RBV-01", "root is black (valid)", test_rbv01_root_is_black_valid},
+    {"RBV-02", "root is black, violated (invalid)", test_rbv02_root_is_black_invalid},
+    {"RBV-03", "no red node has a red child (valid)", test_rbv03_no_red_red_valid},
+    {"RBV-04", "red-red violation (invalid)", test_rbv04_red_red_invalid},
+    {"RBV-05", "equal black-height on every path (valid)", test_rbv05_black_height_valid},
+    {"RBV-06", "black-height mismatch (invalid)", test_rbv06_black_height_invalid},
+    {"RBV-07", "in-order traversal strictly increasing (valid)",
+     test_rbv07_inorder_increasing_valid},
+    {"RBV-08", "BST order violation (invalid)", test_rbv08_bst_order_invalid},
+    {"RBV-09", "rb_size matches actual node count (valid)",
+     test_rbv09_size_matches_count_valid},
+    {"RBV-10", "size/count mismatch (invalid)", test_rbv10_size_mismatch_invalid},
 };
 
 int main(void) {

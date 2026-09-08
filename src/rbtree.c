@@ -1,25 +1,9 @@
 //Purpose: Implement a full-working, self-sufficient red-black tree
 #include "rbtree.h"
+#include "rbtree_internal.h"
 #include <stdbool.h>
 #include <stdlib.h>
-
-typedef enum { RED, BLACK } rb_color_t;
-
-struct rb_node {
-    char *key;              /* heap copy; the tree owns it */
-    void *value;             /* ownership per header contract */
-    struct rb_node *left;
-    struct rb_node *right;
-    struct rb_node *parent;
-    rb_color_t color;
-};
-
-struct rbtree {
-    struct rb_node *root;
-    struct rb_node nil;       /* embedded shared sentinel, always BLACK */
-    size_t size;
-    rb_value_free_fn value_free;
-};
+#include <string.h>
 
 bool rb_fail_next_alloc = false;   /* test-only hook, external linkage */
 
@@ -68,6 +52,42 @@ void rb_destroy(rbtree_t *t) {
     if (t == NULL) return;             /* NULL-safe per header contract */
     rb_destroy_subtree(t, t->root);
     rb_free(t);
+}
+
+static size_t rb_count_nodes(const struct rbtree *t, const struct rb_node *n) {
+    if (n == &t->nil) return 0;
+    return 1 + rb_count_nodes(t, n->left) + rb_count_nodes(t, n->right);
+}
+
+/* Checks BST order (strcmp against the open interval (lo, hi)), the
+ * no-red-red rule, and black-height equality in one pass; *black_height is
+ * only meaningful when this returns true. lo/hi are NULL for "no bound". */
+static bool rb_validate_node(const struct rbtree *t, const struct rb_node *n,
+                              const char *lo, const char *hi, int *black_height) {
+    if (n == &t->nil) {
+        *black_height = 1;
+        return true;
+    }
+    if (lo != NULL && strcmp(lo, n->key) >= 0) return false;
+    if (hi != NULL && strcmp(n->key, hi) >= 0) return false;
+    if (n->color == RED) {
+        if (n->left != &t->nil && n->left->color == RED) return false;
+        if (n->right != &t->nil && n->right->color == RED) return false;
+    }
+    int bh_left, bh_right;
+    if (!rb_validate_node(t, n->left, lo, n->key, &bh_left)) return false;
+    if (!rb_validate_node(t, n->right, n->key, hi, &bh_right)) return false;
+    if (bh_left != bh_right) return false;
+    *black_height = bh_left + (n->color == BLACK ? 1 : 0);
+    return true;
+}
+
+int rb_validate(const rbtree_t *t) {
+    if (t->root->color != BLACK) return 1;
+    int black_height;
+    if (!rb_validate_node(t, t->root, NULL, NULL, &black_height)) return 1;
+    if (rb_count_nodes(t, t->root) != t->size) return 1;
+    return 0;
 }
 
 
