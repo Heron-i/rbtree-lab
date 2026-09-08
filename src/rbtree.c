@@ -90,4 +90,19 @@ int rb_validate(const rbtree_t *t) {
     return 0;
 }
 
+void *rb_find(const rbtree_t *t, const char *key) {
+    const struct rb_node *n = t->root;
+    /* invariant: if key is present, it lies within the subtree rooted at n */
+    while (n != &t->nil) {
+        int cmp = strcmp(key, n->key);
+        if (cmp == 0) return n->value;
+        n = (cmp < 0) ? n->left : n->right;
+    }
+    return NULL;
+}
+
+size_t rb_size(const rbtree_t *t) {
+    return t->size;
+}
+
 
