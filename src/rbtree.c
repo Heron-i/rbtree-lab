@@ -105,4 +105,156 @@ size_t rb_size(const rbtree_t *t) {
     return t->size;
 }
 
+static void rotate_left(struct rbtree *t, struct rb_node *x) {
+    struct rb_node *y = x->right;
+    x->right = y->left;
+    if (y->left != &t->nil) y->left->parent = x;
+    y->parent = x->parent;
+    if (x->parent == &t->nil) {
+        t->root = y;
+    } else if (x == x->parent->left) {
+        x->parent->left = y;
+    } else {
+        x->parent->right = y;
+    }
+    y->left = x;
+    x->parent = y;
+}
+
+static void rotate_right(struct rbtree *t, struct rb_node *x) {
+    struct rb_node *y = x->left;
+    x->left = y->right;
+    if (y->right != &t->nil) y->right->parent = x;
+    y->parent = x->parent;
+    if (x->parent == &t->nil) {
+        t->root = y;
+    } else if (x == x->parent->right) {
+        x->parent->right = y;
+    } else {
+        x->parent->left = y;
+    }
+    y->right = x;
+    x->parent = y;
+}
+
+/* Frees a node allocated by node_alloc that never made it into the tree
+ * (its key copy allocation failed). Not for use on a linked-in node --
+ * rb_destroy_subtree already owns that path. */
+static void node_release(struct rb_node *z) {
+    rb_free(z);
+}
+
+/* Allocates and fully initializes a new RED leaf node (key copied, value
+ * stored, left/right pointed at the sentinel, parent set to the given
+ * would-be parent). Returns NULL, with everything already cleaned up, on
+ * either allocation failure -- the caller does not need to free anything. */
+static struct rb_node *node_alloc(struct rbtree *t, const char *key, void *value,
+                                   struct rb_node *parent) {
+    struct rb_node *z = rb_malloc(sizeof *z);
+    if (z == NULL) goto fail;
+
+    size_t key_len = strlen(key) + 1;
+    char *key_copy = rb_malloc(key_len);
+    if (key_copy == NULL) goto fail_release_node;
+    memcpy(key_copy, key, key_len);
+
+    z->key = key_copy;
+    z->value = value;
+    z->left = &t->nil;
+    z->right = &t->nil;
+    z->parent = parent;
+    z->color = RED;
+    return z;
+
+fail_release_node:
+    node_release(z);
+fail:
+    return NULL;
+}
+
+/* Standard CLRS RB-INSERT-FIXUP. z is always RED; the loop's only
+ * invariant violation to fix is a possible red-red edge between z and
+ * z->parent. Each side (parent is a left child vs. a right child of the
+ * grandparent) is a mirror image of the other: same uncle-red recolor
+ * case, same black-uncle triangle-then-line rotation, just left/right and
+ * rotate_left/rotate_right swapped. */
+static void insert_fixup(struct rbtree *t, struct rb_node *z) {
+    /* invariant: z is RED; loop continues only while it has a RED parent
+     * (a genuine violation), and terminates on its own once z reaches a
+     * BLACK parent or the root (whose parent is the BLACK sentinel) */
+    while (z->parent->color == RED) {
+        if (z->parent == z->parent->parent->left) {
+            struct rb_node *uncle = z->parent->parent->right;
+            if (uncle->color == RED) {
+                /* case: red uncle -- recolor and push the violation up to
+                 * the grandparent */
+                z->parent->color = BLACK;
+                uncle->color = BLACK;
+                z->parent->parent->color = RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->right) {
+                    /* triangle: straighten into a line first */
+                    z = z->parent;
+                    rotate_left(t, z);
+                }
+                /* line: single rotation at the grandparent + recolor */
+                z->parent->color = BLACK;
+                z->parent->parent->color = RED;
+                rotate_right(t, z->parent->parent);
+            }
+        } else {
+            struct rb_node *uncle = z->parent->parent->left;
+            if (uncle->color == RED) {
+                z->parent->color = BLACK;
+                uncle->color = BLACK;
+                z->parent->parent->color = RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->left) {
+                    z = z->parent;
+                    rotate_right(t, z);
+                }
+                z->parent->color = BLACK;
+                z->parent->parent->color = RED;
+                rotate_left(t, z->parent->parent);
+            }
+        }
+    }
+    t->root->color = BLACK;
+}
+
+int rb_insert(rbtree_t *t, const char *key, void *value) {
+    struct rb_node *parent = &t->nil;
+    struct rb_node *cur = t->root;
+    /* invariant: if key is already present, it lies within the subtree
+     * rooted at cur; parent trails cur as its would-be parent */
+    while (cur != &t->nil) {
+        int cmp = strcmp(key, cur->key);
+        if (cmp == 0) {
+            void *old_value = cur->value;
+            cur->value = value;
+            if (t->value_free != NULL) t->value_free(old_value);
+            return 0;
+        }
+        parent = cur;
+        cur = (cmp < 0) ? cur->left : cur->right;
+    }
+
+    struct rb_node *z = node_alloc(t, key, value, parent);
+    if (z == NULL) return -1;
+
+    if (parent == &t->nil) {
+        t->root = z;
+    } else if (strcmp(key, parent->key) < 0) {
+        parent->left = z;
+    } else {
+        parent->right = z;
+    }
+
+    t->size++;
+    insert_fixup(t, z);
+    return 0;
+}
+
 
