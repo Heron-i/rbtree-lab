@@ -1,14 +1,20 @@
 //Purpose: My unit tests created with known specs and edge cases (table-driven tests)
-// Implements RBC-01, RBC-02, RBC-03, RBC-04, RBC-05, RBC-08, RBC-10 from the
-// rb_create test plan. The remaining planned cases (RBC-06, RBC-07, RBC-09,
-// RBC-11, RBC-12, RBC-13) are deferred but still tracked in the plan.
+// RBC-01, RBC-02, RBC-03, RBC-04, RBC-05, RBC-10 (rb_create test plan) now
+// live in tests/test_create.c, split out so that file builds and runs
+// independently of every operation besides rb_create/rb_destroy/rb_validate.
+// RBC-08 stays here (see the comment above it below) because it depends on
+// rb_insert. The remaining planned cases (RBC-06, RBC-07, RBC-09, RBC-11,
+// RBC-12, RBC-13) are deferred but still tracked in the plan.
 // Implements RBD-01, RBD-03, RBD-04 from the rb_delete test plan. RBD-02
 // (black leaf with a red sibling) is written below but not yet wired into
 // `tests[]`: its insert sequence needs to be confirmed against the real
 // rb_insert implementation first (see the function's comment) since node
 // color isn't observable through the public API.
-// Implements RBX-01..RBX-06 from the rb_destroy test plan. These stick to
-// what's observable in-process (crash-freedom, value_free call
+// RBX-01, RBX-02 (rb_destroy test plan) now live in tests/test_destroy.c,
+// split out so that file builds and runs independently of rb_insert/
+// rb_delete. RBX-03..RBX-06 stay here (see the comment above RBX-03 below)
+// because they depend on rb_insert (RBX-06 also on rb_delete). These stick
+// to what's observable in-process (crash-freedom, value_free call
 // count/values); leak/double-free correctness (e.g. "every node freed
 // together with its key copy") is verified separately by `make memcheck`.
 // Implements RBV-01..RBV-10 from the rb_validate test plan (root-black,
@@ -25,13 +31,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* test-only fault-injection hook defined in rbtree.c (external linkage,
- * intentionally not part of the public header contract) */
-extern bool rb_fail_next_alloc;
-
-/* value_free test double. For RBC-02 it just needs to be a valid callback;
- * RBX-04 also uses its call count/recorded values to check rb_destroy
- * invokes it exactly once per node with the right value pointers. */
+/* value_free test double: RBX-04 uses its call count/recorded values to
+ * check rb_destroy invokes it exactly once per node with the right value
+ * pointers. */
 #define FREE_RECORDER_CAP 8
 static void *free_recorder_seen[FREE_RECORDER_CAP];
 static int free_recorder_count;
@@ -57,72 +59,14 @@ static bool free_recorder_saw(void *value) {
     return false;
 }
 
-/* ---- RBC-01: create with value_free = NULL ---- */
-static bool test_rbc01_create_null_value_free(void) {
-    rbtree_t *t = rb_create(NULL);
-    bool ok = (t != NULL);
-    if (!ok) fprintf(stderr, "    rb_create(NULL) returned NULL, expected non-NULL\n");
-    if (t) rb_destroy(t);
-    return ok;
-}
-
-/* ---- RBC-02: create with a real value_free callback ---- */
-static bool test_rbc02_create_with_value_free(void) {
-    rbtree_t *t = rb_create(free_recorder);
-    bool ok = (t != NULL);
-    if (!ok) fprintf(stderr, "    rb_create(free_recorder) returned NULL, expected non-NULL\n");
-    if (t) rb_destroy(t);
-    return ok;
-}
-
-/* ---- RBC-03: fresh tree has size 0 ---- */
-static bool test_rbc03_fresh_size_zero(void) {
-    rbtree_t *t = rb_create(NULL);
-    if (!t) {
-        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot check size\n");
-        return false;
-    }
-    size_t n = rb_size(t);
-    bool ok = (n == 0);
-    if (!ok) fprintf(stderr, "    rb_size(fresh tree) = %zu, expected 0\n", n);
-    rb_destroy(t);
-    return ok;
-}
-
-/* ---- RBC-04: fresh tree passes full validation ---- */
-static bool test_rbc04_fresh_validates(void) {
-    rbtree_t *t = rb_create(NULL);
-    if (!t) {
-        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot validate\n");
-        return false;
-    }
-    int rc = rb_validate(t);
-    bool ok = (rc == 0);
-    if (!ok) fprintf(stderr, "    rb_validate(fresh tree) = %d, expected 0\n", rc);
-    rb_destroy(t);
-    return ok;
-}
-
-/* ---- RBC-05: sentinel is BLACK immediately at creation, not just
- * post-insert/post-fixup ---- */
-static bool test_rbc05_sentinel_black_at_creation(void) {
-    rbtree_t *t = rb_create(NULL);
-    if (!t) {
-        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot validate\n");
-        return false;
-    }
-    int rc = rb_validate(t);
-    bool ok = (rc == 0);
-    if (!ok) {
-        fprintf(stderr,
-                "    rb_validate(fresh tree, pre-insert) = %d, expected 0 "
-                "(sentinel must be BLACK at creation)\n",
-                rc);
-    }
-    rb_destroy(t);
-    return ok;
-}
-
+/* RBC-08 lives here rather than in tests/test_create.c: it calls rb_insert
+ * to prove two independently-created trees don't share state, so it can't
+ * link until rb_insert exists. tests/test_create.c is meant to build and
+ * pass independently of every operation besides rb_create/rb_destroy/
+ * rb_validate; keeping this test there would break that property for the
+ * whole file. It stays here, alongside the other tests that already depend
+ * on rb_insert/rb_delete/rb_foreach, until those exist and this whole file
+ * links again. */
 /* ---- RBC-08: two trees created independently don't share state ---- */
 static bool test_rbc08_independent_trees(void) {
     rbtree_t *t1 = rb_create(NULL);
@@ -143,20 +87,6 @@ static bool test_rbc08_independent_trees(void) {
     }
     rb_destroy(t1);
     rb_destroy(t2);
-    return ok;
-}
-
-/* ---- RBC-10: allocation failure during create returns NULL ---- */
-static bool test_rbc10_alloc_failure_returns_null(void) {
-    rb_fail_next_alloc = true;
-    rbtree_t *t = rb_create(NULL);
-    bool ok = (t == NULL);
-    if (!ok) {
-        fprintf(stderr,
-                "    rb_create(NULL) with rb_fail_next_alloc=true returned non-NULL, "
-                "expected NULL\n");
-        rb_destroy(t);
-    }
     return ok;
 }
 
@@ -287,23 +217,14 @@ static bool test_rbd04_delete_root(void) {
     return ok;
 }
 
-/* ---- RBX-01: rb_destroy(NULL) is safe ---- */
-static bool test_rbx01_destroy_null_is_safe(void) {
-    rb_destroy(NULL);
-    return true;   /* success == did not crash */
-}
-
-/* ---- RBX-02: destroying a freshly-created (empty) tree runs cleanly ---- */
-static bool test_rbx02_destroy_empty_tree(void) {
-    rbtree_t *t = rb_create(NULL);
-    if (!t) {
-        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
-        return false;
-    }
-    rb_destroy(t);
-    return true;
-}
-
+/* RBX-03..RBX-06 live here rather than in tests/test_destroy.c: each calls
+ * rb_insert to build a populated tree (RBX-06 also calls rb_delete to
+ * thin it first), so none of them can link until those exist.
+ * tests/test_destroy.c is meant to build and pass independently of every
+ * operation besides rb_create/rb_destroy; keeping these there would break
+ * that property for the whole file. They stay here, alongside the other
+ * tests that already depend on rb_insert/rb_delete/rb_foreach, until those
+ * exist and this whole file links again. */
 /* ---- RBX-03: destroying a populated tree runs cleanly ----
  * (node-struct + key-copy freeing itself is verified by `make memcheck`,
  * not observable from here; this confirms a real, non-trivial tree was
@@ -627,20 +548,11 @@ typedef struct {
 } test_case_t;
 
 static const test_case_t tests[] = {
-    {"RBC-01", "create with value_free = NULL", test_rbc01_create_null_value_free},
-    {"RBC-02", "create with a real value_free callback", test_rbc02_create_with_value_free},
-    {"RBC-03", "fresh tree has size 0", test_rbc03_fresh_size_zero},
-    {"RBC-04", "fresh tree passes full validation", test_rbc04_fresh_validates},
-    {"RBC-05", "sentinel is BLACK immediately at creation", test_rbc05_sentinel_black_at_creation},
     {"RBC-08", "two trees created independently don't share state",
      test_rbc08_independent_trees},
-    {"RBC-10", "allocation failure during create returns NULL",
-     test_rbc10_alloc_failure_returns_null},
     {"RBD-01", "delete a red leaf", test_rbd01_delete_red_leaf},
     {"RBD-03", "delete a node with two children", test_rbd03_delete_two_children},
     {"RBD-04", "delete the root of a one-node tree", test_rbd04_delete_root},
-    {"RBX-01", "rb_destroy(NULL) is safe", test_rbx01_destroy_null_is_safe},
-    {"RBX-02", "destroying a freshly-created tree runs cleanly", test_rbx02_destroy_empty_tree},
     {"RBX-03", "destroying a populated tree runs cleanly", test_rbx03_destroy_populated_tree},
     {"RBX-04", "value_free called exactly once per node with correct values",
      test_rbx04_value_free_called_correctly},
