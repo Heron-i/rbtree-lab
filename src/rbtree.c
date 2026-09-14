@@ -257,4 +257,17 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
     return 0;
 }
 
+static void rb_foreach_node(const struct rbtree *t, const struct rb_node *n,
+                             void (*fn)(const char *key, void *value, void *ctx), void *ctx) {
+    if (n == &t->nil) return;          /* base case: sentinel marks "no node" */
+    rb_foreach_node(t, n->left, fn, ctx);
+    fn(n->key, n->value, ctx);
+    rb_foreach_node(t, n->right, fn, ctx);
+}
+
+void rb_foreach(const rbtree_t *t, void (*fn)(const char *key, void *value, void *ctx),
+                 void *ctx) {
+    rb_foreach_node(t, t->root, fn, ctx);
+}
+
 
