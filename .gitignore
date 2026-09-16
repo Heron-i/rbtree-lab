@@ -1,4 +1,3 @@
 build/
-DEVLOG.md
-Makefile
-rbtree.h
+extract_claude.py
+all_sessions.jsonl
