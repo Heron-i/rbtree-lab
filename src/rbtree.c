@@ -257,6 +257,155 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
     return 0;
 }
 
+/* Replaces the subtree rooted at u with the subtree rooted at v, rewiring
+ * u->parent's child pointer accordingly. v may be &t->nil. */
+static void transplant(struct rbtree *t, struct rb_node *u, struct rb_node *v) {
+    if (u->parent == &t->nil) {
+        t->root = v;
+    } else if (u == u->parent->left) {
+        u->parent->left = v;
+    } else {
+        u->parent->right = v;
+    }
+    /* set even when v is the sentinel: delete_fixup walks x->parent when x
+     * has no children, and that read only ever happens when rb_delete's
+     * y_original_color was BLACK -- the only case delete_fixup runs at
+     * all. Nothing else reads t->nil.parent. */
+    v->parent = u->parent;
+}
+
+/* Leftmost node of n's subtree (the in-order successor's starting point).
+ * invariant: if n's subtree is nonempty, the minimum lies within the
+ * subtree rooted at n */
+static struct rb_node *tree_minimum(struct rbtree *t, struct rb_node *n) {
+    while (n->left != &t->nil) n = n->left;
+    return n;
+}
+
+/* Standard CLRS RB-DELETE-FIXUP. x carries an "extra black" that must be
+ * absorbed somewhere up the tree before the loop can terminate. Each side
+ * (x is a left child vs. a right child of its parent) is a mirror image of
+ * the other: same red-sibling rotate, same both-nephews-black recolor,
+ * same near-red/far-black rotate-then-fall-through, same far-red terminal
+ * rotate -- just left/right and rotate_left/rotate_right swapped, matching
+ * insert_fixup's style. */
+static void delete_fixup(struct rbtree *t, struct rb_node *x) {
+    /* invariant: x carries the extra black only while it's BLACK and not
+     * yet the root; the loop terminates on its own once x reaches a RED
+     * node (recolored BLACK below, absorbing the extra black) or the root */
+    while (x != t->root && x->color == BLACK) {
+        if (x == x->parent->left) {
+            struct rb_node *w = x->parent->right;
+            if (w->color == RED) {
+                /* case 1: red sibling -- recolor + rotate so the new
+                 * sibling is guaranteed BLACK, converting into case 2/3/4 */
+                w->color = BLACK;
+                x->parent->color = RED;
+                rotate_left(t, x->parent);
+                w = x->parent->right;
+            }
+            if (w->left->color == BLACK && w->right->color == BLACK) {
+                /* case 2: both nephews BLACK -- absorb the extra black by
+                 * recoloring the sibling RED and pushing it up a level */
+                w->color = RED;
+                x = x->parent;
+            } else {
+                if (w->right->color == BLACK) {
+                    /* case 3: near nephew RED, far nephew BLACK -- rotate
+                     * at the sibling to convert into case 4 */
+                    w->left->color = BLACK;
+                    w->color = RED;
+                    rotate_right(t, w);
+                    w = x->parent->right;
+                }
+                /* case 4: far nephew RED -- recolor + rotate at the
+                 * parent, fully restoring black-height; terminates */
+                w->color = x->parent->color;
+                x->parent->color = BLACK;
+                w->right->color = BLACK;
+                rotate_left(t, x->parent);
+                x = t->root;
+            }
+        } else {
+            struct rb_node *w = x->parent->left;
+            if (w->color == RED) {
+                w->color = BLACK;
+                x->parent->color = RED;
+                rotate_right(t, x->parent);
+                w = x->parent->left;
+            }
+            if (w->right->color == BLACK && w->left->color == BLACK) {
+                w->color = RED;
+                x = x->parent;
+            } else {
+                if (w->left->color == BLACK) {
+                    w->right->color = BLACK;
+                    w->color = RED;
+                    rotate_left(t, w);
+                    w = x->parent->left;
+                }
+                w->color = x->parent->color;
+                x->parent->color = BLACK;
+                w->left->color = BLACK;
+                rotate_right(t, x->parent);
+                x = t->root;
+            }
+        }
+    }
+    x->color = BLACK;
+}
+
+int rb_delete(rbtree_t *t, const char *key) {
+    struct rb_node *z = t->root;
+    /* invariant: if key is present, it lies within the subtree rooted at z */
+    while (z != &t->nil) {
+        int cmp = strcmp(key, z->key);
+        if (cmp == 0) break;
+        z = (cmp < 0) ? z->left : z->right;
+    }
+    if (z == &t->nil) return -1;
+
+    struct rb_node *y = z;
+    rb_color_t y_original_color = y->color;
+    struct rb_node *x;
+
+    if (z->left == &t->nil) {
+        x = z->right;
+        transplant(t, z, x);
+    } else if (z->right == &t->nil) {
+        x = z->left;
+        transplant(t, z, x);
+    } else {
+        y = tree_minimum(t, z->right);
+        y_original_color = y->color;
+        x = y->right;
+        if (y->parent == z) {
+            x->parent = y;
+        } else {
+            transplant(t, y, y->right);
+            y->right = z->right;
+            y->right->parent = y;
+        }
+        transplant(t, z, y);
+        y->left = z->left;
+        y->left->parent = y;
+        y->color = z->color;
+    }
+
+    /* z is fully unlinked here -- every incoming pointer was already
+     * rewritten by the transplant(s) above -- so it's freed now, strictly
+     * before delete_fixup runs; nothing past this point may dereference z */
+    rb_free(z->key);
+    if (t->value_free != NULL) t->value_free(z->value);
+    rb_free(z);
+
+    if (y_original_color == BLACK) {
+        delete_fixup(t, x);
+    }
+    t->size--;
+    return 0;
+}
+
 static void rb_foreach_node(const struct rbtree *t, const struct rb_node *n,
                              void (*fn)(const char *key, void *value, void *ctx), void *ctx) {
     if (n == &t->nil) return;          /* base case: sentinel marks "no node" */

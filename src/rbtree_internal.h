@@ -20,7 +20,9 @@ struct rb_node {
 
 struct rbtree {
     struct rb_node *root;
-    struct rb_node nil;       /* embedded shared sentinel, always BLACK */
+    struct rb_node nil;       /* embedded shared sentinel, always BLACK;
+                               * nil.parent is transiently repurposed by
+                               * rb_delete's transplant/delete_fixup only */
     size_t size;
     rb_value_free_fn value_free;
 };
