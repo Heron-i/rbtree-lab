@@ -1,11 +1,10 @@
 // Purpose: Randomized stress driver for discovering potential unknown flaws.
-// Differentially fuzzes rb_insert/rb_find against an independent
+// Differentially fuzzes rb_insert/rb_find/rb_delete against an independent
 // sorted-array reference model (bounded key universe), validating full
 // tree invariants at least every 100 operations and cross-checking a full
-// rb_foreach traversal on a coarser cadence. rb_delete is intentionally
-// out of scope for this first pass, as is allocation-failure injection
-// (rb_fail_next_alloc) -- both are left for a later, more extensive
-// iteration of this fuzzer.
+// rb_foreach traversal on a coarser cadence. Allocation-failure injection
+// (rb_fail_next_alloc) is intentionally out of scope for this pass and is
+// left for a later, more extensive iteration of this fuzzer.
 #include "rbtree.h"
 
 #include <stdbool.h>
@@ -115,6 +114,19 @@ static void model_upsert(model_t *m, const char *key, void *value) {
     m->count++;
 }
 
+/* Removes key from the model. Caller confirms presence first via
+ * model_get, since rb_delete's rc is the source of truth for whether the
+ * key existed. Never touches .value's pointee -- rb_delete already freed
+ * it through the tree's value_free callback. */
+static void model_remove(model_t *m, const char *key) {
+    bool found;
+    size_t idx = model_lower_bound(m, key, &found);
+    if (!found) return; /* defensive; call sites already checked */
+    memmove(&m->entries[idx], &m->entries[idx + 1],
+            (m->count - idx - 1) * sizeof *m->entries);
+    m->count--;
+}
+
 /* ---- test values: content-stamped so the oracle can catch corruption,
  * not just stale/wrong pointers ---- */
 typedef struct {
@@ -125,6 +137,8 @@ typedef struct {
 static void value_free_fn(void *v) {
     free(v);
 }
+
+typedef enum { OP_INSERT, OP_FIND, OP_DELETE } op_kind_t;
 
 static void make_key(char *buf, size_t buflen, unsigned idx) {
     snprintf(buf, buflen, "k%05u", idx);
@@ -205,9 +219,10 @@ int main(int argc, char **argv) {
 
     /* invariant: ok stays true only while every check so far has matched the model */
     for (unsigned long op = 0; ok && op < total_ops; op++) {
-        bool do_insert = (rng_next(&seed) % 100) < 55;
+        unsigned roll = (unsigned)(rng_next(&seed) % 100);
+        op_kind_t op_kind = (roll < 50) ? OP_INSERT : (roll < 80) ? OP_FIND : OP_DELETE;
 
-        if (do_insert) {
+        if (op_kind == OP_INSERT) {
             unsigned idx = (unsigned)(rng_next(&seed) % POOL_SIZE);
             make_key(keybuf, sizeof keybuf, idx);
 
@@ -228,7 +243,7 @@ int main(int argc, char **argv) {
                  * value is not consumed, so it's still ours to free */
                 free(val);
             }
-        } else {
+        } else if (op_kind == OP_FIND) {
             unsigned range = POOL_SIZE + OOP_EXTRA;
             unsigned idx = (unsigned)(rng_next(&seed) % range);
             make_key(keybuf, sizeof keybuf, idx);
@@ -241,6 +256,23 @@ int main(int argc, char **argv) {
                         "fuzz: find mismatch at op %lu: key=\"%s\" expected=%p actual=%p (model says %s)\n",
                         op, keybuf, expected, actual, found ? "present" : "absent");
                 ok = false;
+            }
+        } else {
+            unsigned range = POOL_SIZE + OOP_EXTRA;
+            unsigned idx = (unsigned)(rng_next(&seed) % range);
+            make_key(keybuf, sizeof keybuf, idx);
+
+            bool found;
+            model_get(&model, keybuf, &found);
+            int expected_rc = found ? 0 : -1;
+            int rc = rb_delete(tree, keybuf);
+            if (rc != expected_rc) {
+                fprintf(stderr,
+                        "fuzz: delete mismatch at op %lu: key=\"%s\" expected_rc=%d actual_rc=%d (model says %s)\n",
+                        op, keybuf, expected_rc, rc, found ? "present" : "absent");
+                ok = false;
+            } else if (found) {
+                model_remove(&model, keybuf);
             }
         }
 
