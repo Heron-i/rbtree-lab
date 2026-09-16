@@ -893,6 +893,152 @@ static bool test_rbd16_sequential_delete_to_empty(void) {
     return ok;
 }
 
+/* ---- RBD-17: delete-fixup case 2, mirror branch, isolated (mirror of
+ * RBD-09) ----
+ * Hand-traced against the standard CLRS insert-fixup algorithm: inserting
+ * 80,70,60,50,40,30,20,10 (descending -- the structural mirror of RBD-09's
+ * ascending 10..80) yields 50B(30R(20B(10R,nil),40B),70R(60B,80B)).
+ * Deleting "80" isolates delete-fixup case 2's mirror branch
+ * (x==x->parent->right, sibling on the left) -- RBD-09/10 only ever take
+ * the non-mirror (x==x->parent->left) branch. */
+static bool test_rbd17_case2_isolated_mirror(void) {
+    rbtree_t *t = rb_create(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
+        return false;
+    }
+    const char *keys[] = {"80", "70", "60", "50", "40", "30", "20", "10"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (rb_insert(t, keys[i], NULL) != 0) {
+            fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
+            rb_destroy(t);
+            return false;
+        }
+    }
+    bool shape = (strcmp(t->root->key, "50") == 0) && (t->root->color == BLACK) &&
+                 (strcmp(t->root->left->key, "30") == 0) && (t->root->left->color == RED) &&
+                 (strcmp(t->root->left->left->key, "20") == 0) &&
+                 (t->root->left->left->color == BLACK) &&
+                 (strcmp(t->root->left->left->left->key, "10") == 0) &&
+                 (t->root->left->left->left->color == RED) &&
+                 (t->root->left->left->left->left == &t->nil) &&
+                 (t->root->left->left->left->right == &t->nil) &&
+                 (t->root->left->left->right == &t->nil) &&
+                 (strcmp(t->root->left->right->key, "40") == 0) &&
+                 (t->root->left->right->color == BLACK) &&
+                 (t->root->left->right->left == &t->nil) &&
+                 (t->root->left->right->right == &t->nil) &&
+                 (strcmp(t->root->right->key, "70") == 0) && (t->root->right->color == RED) &&
+                 (strcmp(t->root->right->left->key, "60") == 0) &&
+                 (t->root->right->left->color == BLACK) &&
+                 (t->root->right->left->left == &t->nil) &&
+                 (t->root->right->left->right == &t->nil) &&
+                 (strcmp(t->root->right->right->key, "80") == 0) &&
+                 (t->root->right->right->color == BLACK) &&
+                 (t->root->right->right->left == &t->nil) &&
+                 (t->root->right->right->right == &t->nil);
+    if (!shape) {
+        fprintf(stderr,
+                "    fixture 80,70,60,50,40,30,20,10 did not match the expected shape "
+                "50B(30R(20B(10R,nil),40B),70R(60B,80B)); rb_delete not exercised\n");
+        rb_destroy(t);
+        return false;
+    }
+    int rc = rb_delete(t, "80");
+    bool ok = (rc == 0) && (strcmp(t->root->key, "50") == 0) && (t->root->color == BLACK) &&
+              (strcmp(t->root->left->key, "30") == 0) && (t->root->left->color == RED) &&
+              (strcmp(t->root->left->left->key, "20") == 0) &&
+              (t->root->left->left->color == BLACK) &&
+              (strcmp(t->root->left->left->left->key, "10") == 0) &&
+              (t->root->left->left->left->color == RED) &&
+              (strcmp(t->root->left->right->key, "40") == 0) &&
+              (t->root->left->right->color == BLACK) &&
+              (strcmp(t->root->right->key, "70") == 0) && (t->root->right->color == BLACK) &&
+              (strcmp(t->root->right->left->key, "60") == 0) &&
+              (t->root->right->left->color == RED) && (t->root->right->left->left == &t->nil) &&
+              (t->root->right->left->right == &t->nil) && (t->root->right->right == &t->nil);
+    ok = ok && (rb_validate(t) == 0) && (rb_size(t) == 7);   /* secondary consistency check */
+    if (!ok) {
+        fprintf(stderr,
+                "    delete(\"80\"): tree did not match the expected post-delete shape "
+                "50B(30R(20B(10R,nil),40B),70B(60R,nil)); rb_delete rc=%d (want 0), "
+                "rb_validate=%d, rb_size=%zu (want 7)\n",
+                rc, rb_validate(t), rb_size(t));
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBD-18: rb_delete's deep-successor splice (y->parent != z) ----
+ * Hand-traced against the standard CLRS insert-fixup algorithm: inserting
+ * 50,30,80,70,90,60 yields 50B(30B,80R(70B(60R,nil),90B)). Deleting "50" --
+ * the root, with two children -- picks successor y=tree_minimum(80-subtree)
+ * = "60", whose parent is "70", not "50" -- exercising the
+ * transplant(t,y,y->right) splice branch that RBD-03/12/14 never reach,
+ * since their successors are always the deleted node's immediate right
+ * child. "60" is RED, so delete_fixup never runs here -- this isolates the
+ * splice itself from any fixup-case behavior. */
+static bool test_rbd18_deep_successor_splice(void) {
+    rbtree_t *t = rb_create(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
+        return false;
+    }
+    const char *keys[] = {"50", "30", "80", "70", "90", "60"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (rb_insert(t, keys[i], NULL) != 0) {
+            fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
+            rb_destroy(t);
+            return false;
+        }
+    }
+    bool shape = (strcmp(t->root->key, "50") == 0) && (t->root->color == BLACK) &&
+                 (strcmp(t->root->left->key, "30") == 0) && (t->root->left->color == BLACK) &&
+                 (t->root->left->left == &t->nil) && (t->root->left->right == &t->nil) &&
+                 (strcmp(t->root->right->key, "80") == 0) && (t->root->right->color == RED) &&
+                 (strcmp(t->root->right->left->key, "70") == 0) &&
+                 (t->root->right->left->color == BLACK) &&
+                 (strcmp(t->root->right->left->left->key, "60") == 0) &&
+                 (t->root->right->left->left->color == RED) &&
+                 (t->root->right->left->left->left == &t->nil) &&
+                 (t->root->right->left->left->right == &t->nil) &&
+                 (t->root->right->left->right == &t->nil) &&
+                 (strcmp(t->root->right->right->key, "90") == 0) &&
+                 (t->root->right->right->color == BLACK) &&
+                 (t->root->right->right->left == &t->nil) &&
+                 (t->root->right->right->right == &t->nil);
+    if (!shape) {
+        fprintf(stderr,
+                "    fixture 50,30,80,70,90,60 did not match the expected shape "
+                "50B(30B,80R(70B(60R,nil),90B)); rb_delete not exercised\n");
+        rb_destroy(t);
+        return false;
+    }
+    int rc = rb_delete(t, "50");
+    /* Deliberately minimal post-delete assertions -- just enough to prove
+     * the transplant(t,y,y->right) splice ran (root is the deep successor
+     * "60", and "70" lost its left child), without asserting anything
+     * about a fixup case, since none runs here. */
+    bool ok = (rc == 0) && (strcmp(t->root->key, "60") == 0) && (t->root->color == BLACK) &&
+              (strcmp(t->root->left->key, "30") == 0) && (t->root->left->color == BLACK) &&
+              (strcmp(t->root->right->key, "80") == 0) && (t->root->right->color == RED) &&
+              (strcmp(t->root->right->left->key, "70") == 0) &&
+              (t->root->right->left->color == BLACK) && (t->root->right->left->left == &t->nil) &&
+              (t->root->right->left->right == &t->nil) &&
+              (strcmp(t->root->right->right->key, "90") == 0) &&
+              (t->root->right->right->color == BLACK);
+    ok = ok && (rb_validate(t) == 0) && (rb_size(t) == 5);   /* secondary consistency check */
+    if (!ok) {
+        fprintf(stderr,
+                "    delete(\"50\"): tree did not match the expected post-delete shape "
+                "60B(30B,80R(70B(nil,nil),90B)); rb_delete rc=%d (want 0), rb_validate=%d, "
+                "rb_size=%zu (want 5)\n",
+                rc, rb_validate(t), rb_size(t));
+    }
+    rb_destroy(t);
+    return ok;
+}
+
 typedef struct {
     const char *id;
     const char *name;
@@ -925,6 +1071,10 @@ static const test_case_t tests[] = {
     {"RBD-15", "value_free called exactly once on delete",
      test_rbd15_value_free_called_on_delete},
     {"RBD-16", "sequential delete-to-empty", test_rbd16_sequential_delete_to_empty},
+    {"RBD-17", "delete-fixup case 2, mirror branch, isolated",
+     test_rbd17_case2_isolated_mirror},
+    {"RBD-18", "rb_delete's deep-successor splice (y->parent != z)",
+     test_rbd18_deep_successor_splice},
 };
 
 int main(void) {
