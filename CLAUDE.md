@@ -11,10 +11,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
   ## Hard constraints
   - NEVER modify include/rbtree.h. It is the graded contract.
-  - Check every allocation. malloc can return NULL; a NULL return must
-  leave the tree unchanged and return the documented error code.
-  - NEVER weaken, skip, or delete a test to make the suite pass. If a test
-  looks wrong, stop and explain why instead.
+  - All heap allocation in src/ goes through rb_malloc/rb_free (tests/fault_alloc.h). Direct malloc/free in src/ is a defect.
+  - Any allocation may fail. Every failure path must unwind completely and leave the tree unchanged and return the documented error code.
+  - NEVER weaken, skip, or delete a test to make the suite pass. If a test looks wrong, stop and explain why instead.
+  - Do not implement or modify `src/pool.c` unless the task is specifically concerned with the pooled build.
 
   ## Style
   - C23. -Wall -Wextra -Werror must stay clean. No VLAs.
@@ -27,5 +27,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   approval before editing.
   - build tests first always, then implementation.
   - Commit only from a green state; message format "M<n>: <what>".
-  
 
+  ## Code map (→ = depends on / calls)
+- include/rbtree.h ← src/rbtree.c ← tests/*.c
+- src/rbtree.c → rb_malloc/rb_free (the allocation seam), supplied by:
+  - tests/fault_alloc.c: fault injector, used by test builds
+  - src/pool.c: slab pool, used by the pooled build. Touch only for pooled-build tasks.
+- tests/fuzz.c: randomized ops checked against a reference model
