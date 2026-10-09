@@ -13,10 +13,10 @@
 // rb_validate as their entire verification mechanism over a longer
 // insertion run, explicitly as a secondary, broad-coverage safety net on
 // top of RBI-01..RBI-12's isolated evidence, not a replacement for it.
-// Implements RBI-01..RBI-14 from the rb_insert test plan. Deferred: a
-// mirrored recolor case, an "overwrite never allocates" case (would assert
-// an implementation detail rbtree.h doesn't explicitly promise), and a
-// fixed shuffled-order stress case.
+// Implements RBI-01..RBI-16 from the rb_insert test plan. RBI-15/RBI-16
+// were added for M5 Mutation 1 (allocation-failure injection), whose spec
+// now requires that overwrite never allocates. Deferred: a mirrored
+// recolor case and a fixed shuffled-order stress case.
 #include "rbtree.h"
 #include "../src/rbtree_internal.h"
 
@@ -25,9 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* test-only fault-injection hook defined in rbtree.c (external linkage,
- * intentionally not part of the public header contract) */
-extern bool rb_fail_next_alloc;
+/* test-build fault injector behind rb_malloc (not part of rbtree.h) */
+#include "fault_alloc.h"
 
 /* value_free test double for RBI-04: records what it was called with so we
  * can confirm the OLD value (not the new one) was freed exactly once. */
@@ -269,12 +268,13 @@ static bool test_rbi06_alloc_failure_empty_tree(void) {
         return false;
     }
     static int tag;
-    rb_fail_next_alloc = true;
+    fault_alloc_arm(1);
     int rc = rb_insert(t, "10", &tag);
+    fault_alloc_disarm();
     bool ok = (rc == -1) && (t->root == &t->nil) && (t->size == 0);
     if (!ok) {
         fprintf(stderr,
-                "    rb_insert(\"10\") with rb_fail_next_alloc=true on empty tree: rc=%d "
+                "    rb_insert(\"10\") with fault_alloc_arm(1) on empty tree: rc=%d "
                 "(want -1), root=%p (want nil=%p), size=%zu (want 0)\n",
                 rc, (void *)t->root, (void *)&t->nil, t->size);
     }
@@ -307,8 +307,9 @@ static bool test_rbi07_alloc_failure_nonempty_tree(void) {
     snapshot_walk(t, t->root, &before);
 
     static int tag_new;
-    rb_fail_next_alloc = true;
+    fault_alloc_arm(1);
     int rc = rb_insert(t, "10", &tag_new);
+    fault_alloc_disarm();
 
     struct snapshot_ctx after = {0};
     snapshot_walk(t, t->root, &after);
@@ -316,7 +317,7 @@ static bool test_rbi07_alloc_failure_nonempty_tree(void) {
               snapshots_equal(&before, &after);
     if (!ok) {
         fprintf(stderr,
-                "    rb_insert(\"10\") with rb_fail_next_alloc=true on non-empty tree: rc=%d "
+                "    rb_insert(\"10\") with fault_alloc_arm(1) on non-empty tree: rc=%d "
                 "(want -1), root unchanged=%d, size=%zu (want %zu), snapshot unchanged=%d\n",
                 rc, t->root == root_before, t->size, size_before,
                 snapshots_equal(&before, &after));
@@ -566,6 +567,80 @@ static bool test_rbi14_descending_run(void) {
     return ok;
 }
 
+/* ---- RBI-15: the key-copy allocation (insert's 2nd rb_malloc) fails after
+ * the node allocation succeeded -- the node must be released and the tree
+ * left byte-for-byte unchanged (leak of the node is caught by asan/memcheck) ---- */
+static bool test_rbi15_key_copy_alloc_failure(void) {
+    rbtree_t *t = rb_create(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
+        return false;
+    }
+    static int tag_a, tag_b, tag_c;
+    const char *keys[] = {"50", "25", "75"};
+    void *values[] = {&tag_a, &tag_b, &tag_c};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (rb_insert(t, keys[i], values[i]) != 0) {
+            fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
+            rb_destroy(t);
+            return false;
+        }
+    }
+    struct rb_node *root_before = t->root;
+    size_t size_before = t->size;
+    struct snapshot_ctx before = {0};
+    snapshot_walk(t, t->root, &before);
+
+    static int tag_new;
+    fault_alloc_arm(2);   /* #1 = node succeeds, #2 = key copy fails */
+    int rc = rb_insert(t, "10", &tag_new);
+    fault_alloc_disarm();
+
+    struct snapshot_ctx after = {0};
+    snapshot_walk(t, t->root, &after);
+    bool ok = (rc == -1) && (t->root == root_before) && (t->size == size_before) &&
+              snapshots_equal(&before, &after);
+    if (!ok) {
+        fprintf(stderr,
+                "    rb_insert(\"10\") with fault_alloc_arm(2) (key copy fails): rc=%d "
+                "(want -1), root unchanged=%d, size=%zu (want %zu), snapshot unchanged=%d\n",
+                rc, t->root == root_before, t->size, size_before,
+                snapshots_equal(&before, &after));
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBI-16: overwriting an existing key performs no allocation, so it
+ * succeeds even with the very next allocation armed to fail ---- */
+static bool test_rbi16_overwrite_does_not_allocate(void) {
+    rbtree_t *t = rb_create(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
+        return false;
+    }
+    static int tag_old, tag_new;
+    if (rb_insert(t, "10", &tag_old) != 0) {
+        fprintf(stderr, "    rb_insert(\"10\", old) failed while building the tree\n");
+        rb_destroy(t);
+        return false;
+    }
+    fault_alloc_arm(1);
+    long allocs_before = fault_alloc_total();
+    int rc = rb_insert(t, "10", &tag_new);
+    long allocs = fault_alloc_total() - allocs_before;
+    fault_alloc_disarm();
+    bool ok = (rc == 0) && (allocs == 0) && (rb_find(t, "10") == &tag_new);
+    if (!ok) {
+        fprintf(stderr,
+                "    overwrite \"10\" with fault_alloc_arm(1): rc=%d (want 0), "
+                "allocations=%ld (want 0), value updated=%d\n",
+                rc, allocs, rb_find(t, "10") == &tag_new);
+    }
+    rb_destroy(t);
+    return ok;
+}
+
 typedef struct {
     const char *id;
     const char *name;
@@ -590,6 +665,9 @@ static const test_case_t tests[] = {
     {"RBI-12", "triangle case, black uncle, right-left", test_rbi12_triangle_case_right_left},
     {"RBI-13", "ascending run (secondary consistency check)", test_rbi13_ascending_run},
     {"RBI-14", "descending run (secondary consistency check)", test_rbi14_descending_run},
+    {"RBI-15", "key-copy allocation failure leaves the tree unchanged",
+     test_rbi15_key_copy_alloc_failure},
+    {"RBI-16", "overwrite performs no allocation", test_rbi16_overwrite_does_not_allocate},
 };
 
 int main(void) {

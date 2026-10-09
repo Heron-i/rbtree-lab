@@ -13,9 +13,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* test-only fault-injection hook defined in rbtree.c (external linkage,
- * intentionally not part of the public header contract) */
-extern bool rb_fail_next_alloc;
+/* test-build fault injector behind rb_malloc (not part of rbtree.h) */
+#include "fault_alloc.h"
 
 /* ---- RBC-01: create with value_free = NULL ---- */
 static bool test_rbc01_create_null_value_free(void) {
@@ -87,12 +86,13 @@ static bool test_rbc05_sentinel_black_at_creation(void) {
 
 /* ---- RBC-10: allocation failure during create returns NULL ---- */
 static bool test_rbc10_alloc_failure_returns_null(void) {
-    rb_fail_next_alloc = true;
+    fault_alloc_arm(1);
     rbtree_t *t = rb_create(NULL);
+    fault_alloc_disarm();
     bool ok = (t == NULL);
     if (!ok) {
         fprintf(stderr,
-                "    rb_create(NULL) with rb_fail_next_alloc=true returned non-NULL, "
+                "    rb_create(NULL) with fault_alloc_arm(1) returned non-NULL, "
                 "expected NULL\n");
         rb_destroy(t);
     }

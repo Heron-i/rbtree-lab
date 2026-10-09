@@ -1,20 +1,10 @@
 //Purpose: Implement a full-working, self-sufficient red-black tree
 #include "rbtree.h"
 #include "rbtree_internal.h"
+#include "fault_alloc.h"   /* rb_malloc/rb_free: the only allocation seam */
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-
-bool rb_fail_next_alloc = false;   /* test-only hook, external linkage */
-
-static void *rb_malloc(size_t size) {
-    if (rb_fail_next_alloc) { rb_fail_next_alloc = false; return NULL; }
-    return malloc(size);
-}
-
-static void rb_free(void *ptr) {
-    free(ptr);
-}
 
 rbtree_t *rb_create(rb_value_free_fn value_free) {
     struct rbtree *t = rb_malloc(sizeof *t);
