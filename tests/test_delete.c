@@ -15,7 +15,9 @@
 // -- from any case-1 chaining. RBD-11..14 isolate case-3-then-4 and
 // case-4-direct, both mirrors. RBD-15 mirrors RBX-04's value_free-call-
 // count technique for rb_delete itself. RBD-16 is a broad sequential
-// delete-to-empty regression net, validated after every step. Every new
+// delete-to-empty regression net, validated after every step. RBD-19
+// (M5 Mutation 1) checks that value_free runs only after the delete has
+// committed, so the callback observes a consistent tree. Every new
 // fixture's pre-delete shape, resulting fixup-case path, and post-delete
 // shape were verified against a scratch reference re-implementation of the
 // planned CLRS algorithm before being written down here -- see the
@@ -1039,6 +1041,60 @@ static bool test_rbd18_deep_successor_splice(void) {
     return ok;
 }
 
+/* ---- RBD-19: value_free runs only after the delete has committed -- the
+ * callback must observe a fully consistent tree (fixup done, size already
+ * decremented), never a half-updated one. Fixture 10,05,15,03,07 makes
+ * "10" a black root with two children whose successor "15" is a black
+ * leaf, so delete_fixup actually runs. ---- */
+static rbtree_t *rbd19_tree;
+static int rbd19_calls;
+static int rbd19_validate;
+static size_t rbd19_size;
+
+static void rbd19_observing_free(void *value) {
+    (void)value;
+    if (rbd19_tree == NULL) return;   /* observe the rb_delete only, not rb_destroy */
+    rbd19_calls++;
+    rbd19_validate = rb_validate(rbd19_tree);
+    rbd19_size = rb_size(rbd19_tree);
+}
+
+static bool test_rbd19_value_free_sees_committed_tree(void) {
+    rbtree_t *t = rb_create(rbd19_observing_free);
+    if (!t) {
+        fprintf(stderr, "    rb_create(rbd19_observing_free) returned NULL, cannot build tree\n");
+        return false;
+    }
+    static int tags[5];
+    const char *keys[] = {"10", "05", "15", "03", "07"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (rb_insert(t, keys[i], &tags[i]) != 0) {
+            fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
+            rb_destroy(t);
+            return false;
+        }
+    }
+    bool fixture_ok = (strcmp(t->root->key, "10") == 0) && (t->root->color == BLACK) &&
+                      (t->root->left != &t->nil) && (t->root->right != &t->nil) &&
+                      (t->root->right->color == BLACK);
+    rbd19_tree = t;
+    rbd19_calls = 0;
+    size_t size_before = rb_size(t);
+    int rc = rb_delete(t, "10");
+    bool ok = fixture_ok && (rc == 0) && (rbd19_calls == 1) && (rbd19_validate == 0) &&
+              (rbd19_size == size_before - 1);
+    if (!ok) {
+        fprintf(stderr,
+                "    delete(\"10\"): fixture ok=%d, rc=%d (want 0), callback calls=%d (want 1), "
+                "rb_validate inside callback=%d (want 0), rb_size inside callback=%zu "
+                "(want %zu)\n",
+                fixture_ok, rc, rbd19_calls, rbd19_validate, rbd19_size, size_before - 1);
+    }
+    rbd19_tree = NULL;
+    rb_destroy(t);
+    return ok;
+}
+
 typedef struct {
     const char *id;
     const char *name;
@@ -1075,6 +1131,8 @@ static const test_case_t tests[] = {
      test_rbd17_case2_isolated_mirror},
     {"RBD-18", "rb_delete's deep-successor splice (y->parent != z)",
      test_rbd18_deep_successor_splice},
+    {"RBD-19", "value_free sees a committed, consistent tree",
+     test_rbd19_value_free_sees_committed_tree},
 };
 
 int main(void) {
