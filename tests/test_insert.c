@@ -13,10 +13,16 @@
 // rb_validate as their entire verification mechanism over a longer
 // insertion run, explicitly as a secondary, broad-coverage safety net on
 // top of RBI-01..RBI-12's isolated evidence, not a replacement for it.
-// Implements RBI-01..RBI-16 from the rb_insert test plan. RBI-15/RBI-16
-// were added for M5 Mutation 1 (allocation-failure injection), whose spec
-// now requires that overwrite never allocates. Deferred: a mirrored
-// recolor case and a fixed shuffled-order stress case.
+// Implements RBI-01..RBI-17 from the rb_insert test plan. RBI-15..RBI-17
+// were added for M5 Mutation 1 (allocation-failure injection). Overwrite
+// rule (Mutation-1.md): overwriting a key that is already present MUST NOT
+// ALLOCATE -- zero rb_malloc calls, so it can never fail with -1, even
+// with the very next allocation armed to fail. It reuses the existing node
+// and key copy, swaps in the new value, and releases only the old value.
+// RBI-16 checks the no-allocation rule for an overwrite with a new value;
+// RBI-17 checks it for an overwrite with the SAME value pointer, and also
+// that the tree does not release a value it still owns. Deferred: a
+// mirrored recolor case and a fixed shuffled-order stress case.
 #include "rbtree.h"
 #include "../src/rbtree_internal.h"
 
@@ -641,6 +647,43 @@ static bool test_rbi16_overwrite_does_not_allocate(void) {
     return ok;
 }
 
+/* ---- RBI-17: overwrite with the SAME value pointer the key already holds.
+ * Two rules, both checked:
+ *   1. Overwrite MUST NOT ALLOCATE: zero rb_malloc calls, so it succeeds
+ *      even with the next allocation armed to fail (fault_alloc_arm(1)).
+ *   2. The tree must not release that value: on success the tree owns it,
+ *      so value_free(old) would leave the tree holding a dangling pointer. ---- */
+static bool test_rbi17_reinsert_same_value_not_freed(void) {
+    rbtree_t *t = rb_create(free_recorder);
+    if (!t) {
+        fprintf(stderr, "    rb_create(free_recorder) returned NULL, cannot build tree\n");
+        return false;
+    }
+    static int tag;
+    if (rb_insert(t, "10", &tag) != 0) {
+        fprintf(stderr, "    rb_insert(\"10\") failed while building the tree\n");
+        rb_destroy(t);
+        return false;
+    }
+    free_recorder_reset();
+    fault_alloc_arm(1);
+    long allocs_before = fault_alloc_total();
+    int rc = rb_insert(t, "10", &tag);
+    long allocs = fault_alloc_total() - allocs_before;
+    fault_alloc_disarm();
+    bool ok = (rc == 0) && (allocs == 0) && (free_recorder_count == 0) &&
+              (rb_find(t, "10") == &tag) && (rb_size(t) == 1) && (rb_validate(t) == 0);
+    if (!ok) {
+        fprintf(stderr,
+                "    re-insert \"10\" with its own value under fault_alloc_arm(1): rc=%d (want 0), "
+                "allocations=%ld (want 0), value_free calls=%d (want 0), "
+                "find returns same value=%d, size=%zu (want 1)\n",
+                rc, allocs, free_recorder_count, rb_find(t, "10") == &tag, rb_size(t));
+    }
+    rb_destroy(t);
+    return ok;
+}
+
 typedef struct {
     const char *id;
     const char *name;
@@ -668,6 +711,8 @@ static const test_case_t tests[] = {
     {"RBI-15", "key-copy allocation failure leaves the tree unchanged",
      test_rbi15_key_copy_alloc_failure},
     {"RBI-16", "overwrite performs no allocation", test_rbi16_overwrite_does_not_allocate},
+    {"RBI-17", "re-insert with the same value pointer does not free it",
+     test_rbi17_reinsert_same_value_not_freed},
 };
 
 int main(void) {
