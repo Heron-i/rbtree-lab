@@ -1,6 +1,6 @@
-// Purpose: Unit tests for the slab pool (M5, Mutation 2). Not built yet:
-// joins the Makefile when pool_create/alloc/free/stats/destroy land. The
-// geometry tests (GEO-01..GEO-03) live in tests/test_pool_geom.c.
+// Purpose: Unit tests for the slab pool (M5, Mutation 2), built as
+// build/test_pool. The geometry tests (GEO-01..GEO-03) live in
+// tests/test_pool_geom.c.
 // PL-01..PL-09 drive the pool itself; after every step of every scenario,
 // check_stats takes the numbers pool_stats reports and asserts
 //     live + free_objs == slabs * objs_per_slab

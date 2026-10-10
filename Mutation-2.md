@@ -271,3 +271,56 @@ At your direction, scope narrowed to `pool_geometry` only. The rest of the pool 
 - **Deferred:** the debug `POOL_CHECK` invariant assertion in `pool.c`. It needs the pool's counters, so it lands together with E4-2's remaining functions.
 
 **Verification (gcc-14):** `make test` and `make asan` both pass, with every existing suite green, the sweep at N=401 for A and B (reproduced) and GEO 3/3. `make clean && make memcheck` shows 0 errors and 0 bytes in use for all 11 binaries.
+
+---
+
+# Part 2: the pool implementation and test granularity
+
+## Status (2026-10-10, evening 4 continued): pool API complete
+`src/pool.c` now implements all of `pool_create / pool_alloc / pool_free / pool_stats / pool_destroy`, following Decisions 1-3:
+- in-band `struct slab` chain, with the newest slab first
+- lazy bump carving, with `bump` + `uncarved` in the newest slab
+- an intrusive LIFO free list made of `struct free_slot`
+- the first slab is allocated lazily, by the first `pool_alloc`
+- `pool_stats` is O(1) and accepts `NULL` outputs
+- `pool_free(p, NULL)` is a no-op
+- `pool_destroy` is wholesale and NULL-safe
+
+**Debug invariant (`POOL_CHECK`, active unless `NDEBUG`).** It runs at the exit of `pool_create`, of `pool_alloc` (success and failure) and of `pool_free`. It asserts:
+- the conservation law
+- that walking the free list finds exactly `nfree_list` links. The walk is bounded, so a cycle aborts instead of hanging.
+- that `bump` sits on a slot boundary and that `carved + uncarved == objs_per_slab`
+
+We checked by hand that it fires. A throwaway program that double-frees a slot aborts at `pool.c:58: n <= p->nfree_list`.
+
+**Build:** `tests/test_pool.c` (PL-01..PL-09) is now built as `build/test_pool` and runs in `test`, `asan` and `memcheck`. `test_pool_geom` runs alongside it.
+
+**Verification (gcc-14):**
+- `make test` and `make asan` pass: every existing suite, the sweep at N=401 for A and B (reproduced), GEO 3/3 and PL 9/9.
+- `make clean && make memcheck`: 0 errors and 0 bytes in use for all 12 binaries.
+
+## Approved 2026-10-10: test files for the pool (split approved; crash test still under consideration; nothing created yet)
+Every other public function in the repo has its own test file: `test_create`, `test_insert`, `test_delete`, `test_find`, `test_foreach`, `test_size` and `test_destroy`. Right now `test_pool.c` mixes all five pool functions. The proposal follows the repo's convention: one file per function that has behaviour of its own, plus one cross-function file whose single job is the conservation invariant.
+
+| File | Tests (existing → moved; **new** in bold) | Why separate |
+|---|---|---|
+| `tests/test_pool_geom.c` | GEO-01..03 (unchanged) | Pure arithmetic, no pool needed |
+| `tests/test_pool_create.c` | PL-01, PL-02, PL-09; **PC-04** pool_create(4080) gives exactly 1 slot per slab and the first alloc creates a slab; **PC-05** two pools are independent (interleaved allocs, separate stats, destroy one and use the other) | Creation, rejection and its fault path |
+| `tests/test_pool_alloc.c` | PL-03, PL-05, PL-06, PL-08; **PA-05** an alloc served from the free list makes **no** `rb_malloc`, even under `fault_alloc_arm(1)` (the O(1) path can't fail); **PA-06** policy order: a slot freed from an older slab is reused before the newest slab's uncarved slots, so `uncarved` doesn't change; **PA-07** pool fault sweep: for n = 1, 2, … arm the n-th allocation during a fixed 3-slab alloc/free script; each failed `pool_alloc` returns NULL with the stats triple unchanged, and the sweep ends clean; **PA-08** obj_size 1 (255 per slab) and 4080 (1 per slab) boundary triples | Alloc has the most policy: three sources and one fault point |
+| `tests/test_pool_free.c` | **PF-01** `pool_free(p, NULL)` is a no-op and stats are unchanged; **PF-02** after freeing all of a slab's objects, the slab is still held (`slabs` unchanged, `free_objs` += k): the pool never shrinks; **PF-03** free in reverse, forward and random orders, then re-alloc returns exactly the freed set (each pointer exactly once); **PF-04** the free-list link overwrites only the first 8 bytes: freeing an object filled with a pattern leaves bytes 8..obj_size untouched (white-box, documents where the link lives) | The intrusive link is the core of Decision 1 |
+| `tests/test_pool_destroy.c` | PL-07; **PD-02** destroy a fresh pool with no slab; **PD-03** destroy after every object was freed; **PD-04** `pool_destroy(NULL)` as a standalone case (PL-07 keeps its own call unchanged) | Mirrors `test_destroy.c`; leaks are judged by memcheck |
+| `tests/test_pool.c` (kept, slimmed) | PL-04 random ops; **PS-02** every `NULL` combination of `pool_stats` outputs; **PS-03** the invariant across a long mixed script on three obj_sizes at once (multiple pools) | The `pool_stats` oracle and the invariant, end to end |
+
+`pool_stats` doesn't get its own file. It is the oracle every other file calls through `check_stats`, which moves into a small shared header `tests/pool_check.h` (static inline, so there is no new `.c` file). Its own edge cases (PS-02) live in `test_pool.c`, the invariant file.
+
+**Optional, under your consideration:** `tests/test_pool_debug.c`, a death test for `POOL_CHECK`. It forks, double-frees in the child, and expects `SIGABRT`. It is built only without `NDEBUG`. It turns the hand check above into a regression test. Your call, since it is the first test in the repo to use `fork`.
+
+### Rules for the move
+- PL tests move **verbatim**: same body, same ID, and the ID stays in the test table of the new file. No assertion is changed, dropped or loosened.
+- Each new file gets a header comment listing its IDs, like `test_insert.c` does.
+- In the Makefile, each new binary gets a target, a `test` entry and a `memcheck` entry, following the pattern used for `test_pool`. That adds 4 binaries, or 5 with the debug test.
+- Tests first: write the **new** cases red against today's `pool.c`. Most should pass immediately because they test behaviour already designed in. Any that fail point to a real defect, which we fix with the smallest diff.
+
+### Still ahead (unchanged from Part 1)
+- Step 2: pooled-tree tests (pooled twins in `test_create` / `test_insert` / `test_delete`, plus pooled modes in the sweep and fuzz). They go in the existing files, not new ones.
+- Step 4: wire the pool into `src/rbtree.c` (key-first on the pooled path only).
