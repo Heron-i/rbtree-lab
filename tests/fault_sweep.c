@@ -1,12 +1,20 @@
 // Purpose: Allocation-failure fault sweep (M5, Mutation 1). For n = 1, 2,
-// 3, ... re-runs one fixed, deterministic scenario (insert 200 keys,
-// delete 100, overwrite 50) with the n-th rb_malloc failing, until a run
-// completes without the fault ever firing. Every failed operation must
-// leave the tree exactly as it was (assert_unchanged) and must not consume
-// the caller's value (counting_free). Allocation map for this scenario:
-// #1 = rb_create, then for the i-th insert (0-based) #(2i+2) = node,
-// #(2i+3) = key copy, so N = 1 + 2*NKEYS and every failure site is known
-// in advance. Delete and overwrite must not allocate at all.
+// 3, ... re-runs a fixed, deterministic scenario with the n-th rb_malloc
+// failing, until a run completes without the fault ever firing. Two
+// scenarios are swept:
+//   A: insert 200 keys, then delete 100, then overwrite 50 (the spec's).
+//   B: 50 interleaved rounds of {insert 4 new keys, delete one, overwrite
+//      one, re-insert one with its SAME value pointer}, so faults land on
+//      trees reshaped by delete_fixup and every delete/overwrite also runs
+//      on trees that survived a failed insert.
+// Failure rule (both scenarios): only a new-key insert allocates, exactly
+// twice (node, then key copy). With rel = allocations so far this run, the
+// insert must fail iff rel < n <= rel+2 -- at the node if n == rel+1, at
+// the key copy if n == rel+2 -- and must leave the tree exactly as it was
+// (assert_unchanged) without consuming the caller's value (counting_free).
+// Delete, overwrite and same-pointer re-insert must never allocate: each
+// runs under a live fault, must free exactly the right value (by serial),
+// and every value_free callback must see a fully consistent tree.
 #include "rbtree.h"
 #include "fault_alloc.h"
 
@@ -18,6 +26,9 @@
 #define NKEYS 200
 #define NDELETE 100
 #define NOVERWRITE 50
+#define NROUNDS 50
+#define PER_ROUND 4          /* NROUNDS * PER_ROUND == NKEYS */
+#define MAX_OPS 512
 #define STRIDE 77            /* coprime to NKEYS, so perm() is a permutation */
 #define MAX_N 100000L        /* termination guard */
 #define EXPECTED_N (1L + 2L * NKEYS)
@@ -29,10 +40,15 @@
 struct tval {
     uint32_t magic;
     int id;
+    long serial;   /* unique per allocation, so "which value was freed" is checkable */
 };
 
-static long g_freed;   /* values the tree has released through value_free */
-static bool g_quiet;   /* silences assert_unchanged during its self-test */
+static long g_freed;             /* values the tree has released through value_free */
+static long g_last_freed_serial; /* serial of the most recently released value */
+static long g_bad_callbacks;     /* value_free calls that saw an inconsistent tree */
+static const rbtree_t *g_check_tree;  /* set only around delete/overwrite calls */
+static long g_next_serial;
+static bool g_quiet;             /* silences assert_unchanged during its self-test */
 
 static struct tval *tval_new(int id) {
     struct tval *v = malloc(sizeof *v);   /* plain malloc: must not shift n */
@@ -42,6 +58,7 @@ static struct tval *tval_new(int id) {
     }
     v->magic = TVAL_MAGIC;
     v->id = id;
+    v->serial = g_next_serial++;
     return v;
 }
 
@@ -56,6 +73,9 @@ static void counting_free(void *p) {
         fprintf(stderr, "    value_free got a value with bad magic (double free?)\n");
         abort();
     }
+    /* the tree must already be consistent when it hands a value back */
+    if (g_check_tree != NULL && rb_validate(g_check_tree) != 0) g_bad_callbacks++;
+    g_last_freed_serial = v->serial;
     tval_release(v);
     g_freed++;
 }
@@ -176,7 +196,51 @@ static bool self_test_assert_unchanged(void) {
     return true;
 }
 
-/* ---- task 3: one scenario run with the n-th allocation armed ---- */
+/* ---- scenarios: fixed op lists over the key universe ---- */
+enum op_kind { OP_INSERT, OP_DELETE, OP_OVERWRITE, OP_REINSERT_SAME };
+
+struct op {
+    enum op_kind kind;
+    int id;
+};
+
+struct scenario {
+    const char *name;
+    struct op ops[MAX_OPS];
+    size_t count;
+};
+
+static void push_op(struct scenario *s, enum op_kind kind, int id) {
+    if (s->count >= MAX_OPS) {
+        fprintf(stderr, "    scenario %s exceeds MAX_OPS\n", s->name);
+        exit(EXIT_FAILURE);
+    }
+    s->ops[s->count++] = (struct op){.kind = kind, .id = id};
+}
+
+static void build_scenario_a(struct scenario *s) {
+    s->name = "A: insert 200, delete 100, overwrite 50";
+    s->count = 0;
+    for (int i = 0; i < NKEYS; i++) push_op(s, OP_INSERT, perm(i));
+    for (int j = 0; j < NDELETE; j++) push_op(s, OP_DELETE, perm(2 * j));
+    for (int j = 0; j < NOVERWRITE; j++) push_op(s, OP_OVERWRITE, perm(2 * j + 1));
+}
+
+static void build_scenario_b(struct scenario *s) {
+    s->name = "B: 50 interleaved rounds";
+    s->count = 0;
+    /* invariant: rounds < r inserted keys perm(0 .. PER_ROUND*r - 1) */
+    for (int r = 0; r < NROUNDS; r++) {
+        for (int k = 0; k < PER_ROUND; k++) push_op(s, OP_INSERT, perm(PER_ROUND * r + k));
+        if (r == 0) continue;
+        int prev = PER_ROUND * (r - 1);   /* first key of the previous round */
+        push_op(s, OP_DELETE, perm(prev));
+        push_op(s, OP_OVERWRITE, perm(prev + 1));
+        push_op(s, OP_REINSERT_SAME, perm(prev + 2));
+    }
+}
+
+/* ---- one scenario run with the n-th allocation armed ---- */
 struct run_result {
     bool ok;
     bool fault_fired;
@@ -184,147 +248,219 @@ struct run_result {
     int failures;       /* operations that reported allocation failure */
 };
 
-/* Which operation the n-th allocation belongs to (see the file header). */
-static void expected_site(long n, int *insert_idx, bool *is_key_copy) {
-    *insert_idx = (int)((n - 2) / 2);
-    *is_key_copy = (n % 2) == 1;
+struct run_ctx {
+    rbtree_t *t;
+    struct model m;
+    long n;
+    long t0;
+    struct run_result r;
+};
+
+/* A delete/overwrite/re-insert must not allocate, so it always runs under a
+ * live fault: the run's own fault if still pending, else a fresh arm(1). */
+static bool live_fault_begin(const struct run_ctx *c) {
+    bool pending = fault_alloc_total() - c->t0 < c->n;
+    if (!pending) fault_alloc_arm(1);
+    return pending;
 }
 
-static struct run_result run_scenario(long n) {
-    struct run_result r = {.ok = true};
-    struct model m = {0};
-    long t0 = fault_alloc_total();
+static void live_fault_end(bool pending) {
+    if (!pending) fault_alloc_disarm();
+}
+
+static void fail(struct run_ctx *c) {
+    c->r.ok = false;
+}
+
+/* Insert of a key absent from the model: the only operation that allocates. */
+static void do_new_insert(struct run_ctx *c, int id, const char *key) {
+    long rel = fault_alloc_total() - c->t0;
+    bool expect_fail = rel < c->n && c->n <= rel + 2;
+    const char *site = (c->n == rel + 1) ? "node" : "key-copy";
+    struct tval *v = tval_new(id);
+    struct before b = take_before(c->t, key);
+    int rc = rb_insert(c->t, key, v);
+    if (rc == 0) {
+        if (expect_fail) {
+            fprintf(stderr, "    n=%ld: insert \"%s\" succeeded, expected %s allocation "
+                    "failure\n", c->n, key, site);
+            fail(c);
+        }
+        c->m.val[id] = v;
+        c->m.count++;
+        return;
+    }
+    c->r.failures++;
+    if (rc != -1 || !expect_fail) {
+        fprintf(stderr, "    n=%ld: insert \"%s\" returned %d unexpectedly (rel=%ld)\n",
+                c->n, key, rc, rel);
+        fail(c);
+    }
+    if (!assert_unchanged(c->t, &c->m, &b, key, v)) {
+        fprintf(stderr, "    n=%ld: tree not exactly as it was after failed insert "
+                "\"%s\" (%s allocation)\n", c->n, key, site);
+        fail(c);
+    }
+    tval_release(v);   /* caller still owns it; double free if the tree freed it */
+}
+
+static void do_delete(struct run_ctx *c, int id, const char *key) {
+    struct tval *old = c->m.val[id];
+    bool present = old != NULL;
+    long old_serial = present ? old->serial : -1;
+    long a0 = fault_alloc_total(), f0 = g_freed, b0 = g_bad_callbacks;
+    g_last_freed_serial = -1;
+
+    bool pending = live_fault_begin(c);
+    g_check_tree = c->t;
+    int rc = rb_delete(c->t, key);
+    g_check_tree = NULL;
+    live_fault_end(pending);
+
+    if (fault_alloc_total() != a0) {
+        fprintf(stderr, "    n=%ld: rb_delete(\"%s\") allocated\n", c->n, key);
+        fail(c);
+    }
+    if (g_bad_callbacks != b0) {
+        fprintf(stderr, "    n=%ld: rb_delete(\"%s\") ran value_free on an inconsistent "
+                "tree\n", c->n, key);
+        fail(c);
+    }
+    if (rc != (present ? 0 : -1) || g_freed != f0 + (present ? 1 : 0) ||
+        (present && g_last_freed_serial != old_serial)) {
+        fprintf(stderr, "    n=%ld: rb_delete(\"%s\") rc=%d freed=%ld freed-serial=%ld "
+                "(want serial %ld, present=%d)\n", c->n, key, rc, g_freed - f0,
+                g_last_freed_serial, old_serial, present);
+        fail(c);
+    }
+    if (present) {
+        c->m.val[id] = NULL;
+        c->m.count--;
+    }
+}
+
+static void do_overwrite(struct run_ctx *c, int id, const char *key) {
+    struct tval *old = c->m.val[id];
+    long old_serial = old->serial;
+    struct tval *v = tval_new(id);
+    long a0 = fault_alloc_total(), f0 = g_freed, b0 = g_bad_callbacks;
+    g_last_freed_serial = -1;
+
+    bool pending = live_fault_begin(c);
+    g_check_tree = c->t;
+    int rc = rb_insert(c->t, key, v);
+    g_check_tree = NULL;
+    live_fault_end(pending);
+
+    if (rc != 0) {
+        fprintf(stderr, "    n=%ld: overwrite of \"%s\" returned %d\n", c->n, key, rc);
+        tval_release(v);
+        fail(c);
+        return;
+    }
+    if (fault_alloc_total() != a0 || g_freed != f0 + 1 ||
+        g_last_freed_serial != old_serial || v->magic != TVAL_MAGIC ||
+        g_bad_callbacks != b0) {
+        fprintf(stderr, "    n=%ld: overwrite of \"%s\" allocs=%ld freed=%ld "
+                "freed-serial=%ld (want 0, 1, %ld), new value intact=%d, "
+                "consistent callback=%d\n", c->n, key, fault_alloc_total() - a0,
+                g_freed - f0, g_last_freed_serial, old_serial,
+                v->magic == TVAL_MAGIC, g_bad_callbacks == b0);
+        fail(c);
+    }
+    c->m.val[id] = v;
+}
+
+static void do_reinsert_same(struct run_ctx *c, const char *key, struct tval *v) {
+    long a0 = fault_alloc_total(), f0 = g_freed, b0 = g_bad_callbacks;
+
+    bool pending = live_fault_begin(c);
+    g_check_tree = c->t;
+    int rc = rb_insert(c->t, key, v);
+    g_check_tree = NULL;
+    live_fault_end(pending);
+
+    if (rc != 0 || fault_alloc_total() != a0 || g_freed != f0 ||
+        rb_find(c->t, key) != v || g_bad_callbacks != b0) {
+        fprintf(stderr, "    n=%ld: same-pointer re-insert of \"%s\" rc=%d allocs=%ld "
+                "freed=%ld (want 0, 0, 0): the tree released a value it owns\n",
+                c->n, key, rc, fault_alloc_total() - a0, g_freed - f0);
+        fail(c);
+    }
+}
+
+static struct run_result run_scenario(const struct scenario *s, long n) {
+    struct run_ctx c = {.n = n, .r = {.ok = true}};
+    c.t0 = fault_alloc_total();
     long freed0 = g_freed;
     fault_alloc_arm(n);
 
-    rbtree_t *t = rb_create(counting_free);
-    if (t == NULL) {
-        r.failures++;
+    c.t = rb_create(counting_free);
+    if (c.t == NULL) {
+        c.r.failures++;
         if (n != 1) {
             fprintf(stderr, "    n=%ld: rb_create failed, expected only at n=1\n", n);
-            r.ok = false;
+            fail(&c);
         }
         if (g_freed != freed0) {
             fprintf(stderr, "    n=%ld: value_free ran during failed rb_create\n", n);
-            r.ok = false;
+            fail(&c);
         }
         goto finish;
     }
 
-    /* insert phase. invariant: model holds exactly the keys whose insert
-     * returned 0 so far */
-    for (int i = 0; i < NKEYS; i++) {
-        int id = perm(i);
+    /* invariant: c.m mirrors the tree after every completed op */
+    for (size_t i = 0; i < s->count; i++) {
+        int id = s->ops[i].id;
         char key[8];
         key_of(id, key);
-        struct tval *v = tval_new(id);
-        struct before b = take_before(t, key);
-        int rc = rb_insert(t, key, v);
-        if (rc == 0) {
-            m.val[id] = v;
-            m.count++;
-            continue;
-        }
-        r.failures++;
-        int want_idx;
-        bool want_key_copy;
-        expected_site(n, &want_idx, &want_key_copy);
-        if (rc != -1 || i != want_idx) {
-            fprintf(stderr, "    n=%ld: insert #%d (\"%s\") returned %d, expected failure "
-                    "only at insert #%d\n", n, i, key, rc, want_idx);
-            r.ok = false;
-        }
-        if (!assert_unchanged(t, &m, &b, key, v)) {
-            fprintf(stderr, "    n=%ld: tree not exactly as it was after failed "
-                    "insert #%d (%s allocation)\n",
-                    n, i, want_key_copy ? "key-copy" : "node");
-            r.ok = false;
-        }
-        tval_release(v);   /* caller still owns it; double free if the tree freed it */
-    }
-
-    /* delete phase: must never allocate. invariant: model mirrors the tree */
-    for (int j = 0; j < NDELETE; j++) {
-        int id = perm(2 * j);
-        char key[8];
-        key_of(id, key);
-        bool present = m.val[id] != NULL;
-        long a0 = fault_alloc_total();
-        long f0 = g_freed;
-        int rc = rb_delete(t, key);
-        if (fault_alloc_total() != a0) {
-            fprintf(stderr, "    n=%ld: rb_delete(\"%s\") allocated\n", n, key);
-            r.ok = false;
-        }
-        if (rc != (present ? 0 : -1) || g_freed != f0 + (present ? 1 : 0)) {
-            fprintf(stderr, "    n=%ld: rb_delete(\"%s\") rc=%d freed=%ld (present=%d)\n",
-                    n, key, rc, g_freed - f0, present);
-            r.ok = false;
-        }
-        if (present) {
-            m.val[id] = NULL;
-            m.count--;
+        struct tval *cur = c.m.val[id];
+        switch (s->ops[i].kind) {
+        case OP_INSERT:
+            do_new_insert(&c, id, key);
+            break;
+        case OP_DELETE:
+            do_delete(&c, id, key);
+            break;
+        case OP_OVERWRITE:
+            /* a key whose insert failed earlier is absent: plain insert */
+            if (cur != NULL) do_overwrite(&c, id, key);
+            else do_new_insert(&c, id, key);
+            break;
+        case OP_REINSERT_SAME:
+            if (cur != NULL) do_reinsert_same(&c, key, cur);
+            break;
         }
     }
 
-    /* overwrite phase: an overwrite must never allocate. A key whose insert
-     * failed earlier is absent, so its "overwrite" is a plain insert.
-     * invariant: model mirrors the tree */
-    for (int j = 0; j < NOVERWRITE; j++) {
-        int id = perm(2 * j + 1);
-        char key[8];
-        key_of(id, key);
-        bool present = m.val[id] != NULL;
-        struct tval *v = tval_new(id);
-        long a0 = fault_alloc_total();
-        long f0 = g_freed;
-        int rc = rb_insert(t, key, v);
-        if (rc != 0) {
-            fprintf(stderr, "    n=%ld: overwrite of \"%s\" returned %d\n", n, key, rc);
-            tval_release(v);
-            r.ok = false;
-            continue;
-        }
-        if (present && (fault_alloc_total() != a0 || g_freed != f0 + 1)) {
-            fprintf(stderr, "    n=%ld: overwrite of \"%s\" allocs=%ld freed=%ld "
-                    "(want 0 and 1)\n", n, key, fault_alloc_total() - a0, g_freed - f0);
-            r.ok = false;
-        }
-        if (!present) m.count++;
-        m.val[id] = v;
-    }
-
-    if (rb_validate(t) != 0 || rb_size(t) != m.count || !model_matches(t, &m)) {
+    if (rb_validate(c.t) != 0 || rb_size(c.t) != c.m.count || !model_matches(c.t, &c.m)) {
         fprintf(stderr, "    n=%ld: final tree disagrees with model (size %zu vs %zu)\n",
-                n, rb_size(t), m.count);
-        r.ok = false;
+                n, rb_size(c.t), c.m.count);
+        fail(&c);
     }
     long f0 = g_freed;
-    rb_destroy(t);
-    if (g_freed - f0 != (long)m.count) {
+    rb_destroy(c.t);
+    if (g_freed - f0 != (long)c.m.count) {
         fprintf(stderr, "    n=%ld: rb_destroy freed %ld values, model held %zu\n",
-                n, g_freed - f0, m.count);
-        r.ok = false;
+                n, g_freed - f0, c.m.count);
+        fail(&c);
     }
 
 finish:
     fault_alloc_disarm();
-    r.allocs = fault_alloc_total() - t0;
-    r.fault_fired = r.allocs >= n;
-    if (r.failures != (r.fault_fired ? 1 : 0)) {
+    c.r.allocs = fault_alloc_total() - c.t0;
+    c.r.fault_fired = c.r.allocs >= n;
+    if (c.r.failures != (c.r.fault_fired ? 1 : 0)) {
         fprintf(stderr, "    n=%ld: %d failed operation(s), fault fired=%d\n",
-                n, r.failures, r.fault_fired);
-        r.ok = false;
+                n, c.r.failures, c.r.fault_fired);
+        fail(&c);
     }
-    return r;
+    return c.r;
 }
 
-int main(void) {
-    if (!self_test_assert_unchanged()) {
-        fprintf(stderr, "FAIL: assert_unchanged self-test\n");
-        return EXIT_FAILURE;
-    }
-
+/* Sweeps n = 1, 2, ... over one scenario; true iff every run passed, the
+ * sweep terminated at the predicted N, and the clean run reproduces. */
+static bool sweep(const struct scenario *s) {
     long n = 1;
     long bad = 0;
     struct run_result r;
@@ -332,38 +468,54 @@ int main(void) {
      * left the tree exactly as it was */
     for (;;) {
         if (n > MAX_N) {
-            fprintf(stderr, "FAIL: sweep did not terminate by n=%ld\n", MAX_N);
-            return EXIT_FAILURE;
+            fprintf(stderr, "FAIL [%s]: sweep did not terminate by n=%ld\n", s->name, MAX_N);
+            return false;
         }
-        r = run_scenario(n);
+        r = run_scenario(s, n);
         if (!r.ok) bad++;
         if (!r.fault_fired) break;
         n++;
     }
 
     long total_n = r.allocs;
-    struct run_result again = run_scenario(n);
+    struct run_result again = run_scenario(s, n);
     bool ok = true;
     if (total_n == 0) {
-        fprintf(stderr, "FAIL: N == 0, injector not wired (rbtree.c bypasses rb_malloc)\n");
+        fprintf(stderr, "FAIL [%s]: N == 0, injector not wired (rbtree.c bypasses "
+                "rb_malloc)\n", s->name);
         ok = false;
     } else if (total_n != EXPECTED_N) {
-        fprintf(stderr, "FAIL: N = %ld allocations, expected %ld\n", total_n, EXPECTED_N);
+        fprintf(stderr, "FAIL [%s]: N = %ld allocations, expected %ld\n",
+                s->name, total_n, EXPECTED_N);
         ok = false;
     }
     if (again.fault_fired || again.allocs != total_n || !again.ok) {
-        fprintf(stderr, "FAIL: clean run not reproducible (N=%ld, then %ld)\n",
-                total_n, again.allocs);
+        fprintf(stderr, "FAIL [%s]: clean run not reproducible (N=%ld, then %ld)\n",
+                s->name, total_n, again.allocs);
         ok = false;
     }
     if (bad > 0) {
-        fprintf(stderr, "FAIL: %ld of %ld runs violated the failure contract\n", bad, n);
+        fprintf(stderr, "FAIL [%s]: %ld of %ld runs violated the failure contract\n",
+                s->name, bad, n);
         ok = false;
     }
-    if (!ok) return EXIT_FAILURE;
+    if (ok) {
+        printf("fault sweep [%s]: N=%ld; n=1..%ld each failed at its predicted site and "
+               "left the tree exactly as it was; clean at n=%ld (reproduced)\n",
+               s->name, total_n, total_n, n);
+    }
+    return ok;
+}
 
-    printf("fault sweep: N=%ld; n=1..%ld each failed at its predicted site and left "
-           "the tree exactly as it was; clean at n=%ld (reproduced)\n",
-           total_n, total_n, n);
-    return EXIT_SUCCESS;
+int main(void) {
+    if (!self_test_assert_unchanged()) {
+        fprintf(stderr, "FAIL: assert_unchanged self-test\n");
+        return EXIT_FAILURE;
+    }
+    static struct scenario a, b;
+    build_scenario_a(&a);
+    build_scenario_b(&b);
+    bool ok_a = sweep(&a);
+    bool ok_b = sweep(&b);
+    return (ok_a && ok_b) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
