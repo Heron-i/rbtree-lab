@@ -224,7 +224,8 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
         if (cmp == 0) {
             void *old_value = cur->value;
             cur->value = value;
-            if (t->value_free != NULL) t->value_free(old_value);
+            /* same pointer: the tree already owns it, nothing to release */
+            if (t->value_free != NULL && old_value != value) t->value_free(old_value);
             return 0;
         }
         parent = cur;
@@ -382,17 +383,17 @@ int rb_delete(rbtree_t *t, const char *key) {
         y->color = z->color;
     }
 
-    /* z is fully unlinked here -- every incoming pointer was already
-     * rewritten by the transplant(s) above -- so it's freed now, strictly
-     * before delete_fixup runs; nothing past this point may dereference z */
-    rb_free(z->key);
-    if (t->value_free != NULL) t->value_free(z->value);
-    rb_free(z);
-
     if (y_original_color == BLACK) {
         delete_fixup(t, x);
     }
     t->size--;
+
+    /* commit point passed: z is unlinked (the transplants rewrote every
+     * incoming pointer and delete_fixup never reaches it) and the tree is
+     * consistent again, so value_free observes a valid tree */
+    rb_free(z->key);
+    if (t->value_free != NULL) t->value_free(z->value);
+    rb_free(z);
     return 0;
 }
 
