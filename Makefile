@@ -22,11 +22,22 @@ SIBIN := build/test_size
 FUZZBIN := build/fuzz
 SWEEPBIN := build/fault_sweep
 PRODOBJ := build/rbtree_prod.o
-all: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(PRODOBJ)
+# pool: tested on its own until the tree is wired to it. Geometry only for
+# now; tests/test_pool.c (PL-01..09) joins when the pool API is implemented.
+POOLSRC := src/pool.c tests/fault_alloc.c tests/test_pool_geom.c
+POOLBIN := build/test_pool_geom
+POOLPRODOBJ := build/pool_prod.o
+all: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PRODOBJ) $(POOLPRODOBJ)
 # compile-only: keeps the production (malloc-forwarding) seam -Werror clean
 $(PRODOBJ): src/rbtree.c include/rbtree.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(BASE_CFLAGS) -c src/rbtree.c -o $@
+$(POOLPRODOBJ): src/pool.c src/pool.h tests/fault_alloc.h
+	@mkdir -p build
+	$(CC) $(BASE_CFLAGS) -c src/pool.c -o $@
+$(POOLBIN): $(POOLSRC) src/pool.h tests/fault_alloc.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc $(POOLSRC) -o $@
 $(BIN): $(SRC) $(TSRC) include/rbtree.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(TSRC) -o $@
@@ -57,8 +68,8 @@ $(FUZZBIN): $(SRC) tests/fuzz.c include/rbtree.h tests/fault_alloc.h
 $(SWEEPBIN): $(SRC) tests/fault_sweep.c include/rbtree.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) tests/fault_sweep.c -o $@
-test: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN)
-	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(SWEEPBIN)
+test: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN)
+	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(SWEEPBIN) && ./$(POOLBIN)
 asan: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: clean test
 memcheck: all
@@ -82,6 +93,8 @@ memcheck: all
 	--error-exitcode=1 ./$(FUZZBIN) 20000
 	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(SWEEPBIN)
+	valgrind --leak-check=full --show-leak-kinds=all \
+	--error-exitcode=1 ./$(POOLBIN)
 clean:
 	rm -rf build
 .PHONY: all test asan memcheck clean
