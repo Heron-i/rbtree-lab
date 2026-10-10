@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - Build & unit tests: ‘make test‘
   - Sanitizers: ‘make asan‘ Valgrind: ‘make memcheck‘
   - A change is DONE only when all three pass. Always run them; show output.
+  - Run 'make clean' before 'make memcheck' if you just ran 'make asan'; otherwise memcheck reuses the sanitizer binaries.
+  - Valgrind is slow (the fuzzer runs many random ops; that is expected). Run 'make memcheck' only at the end of each session.
 
   ## Hard constraints
   - NEVER modify include/rbtree.h. It is the graded contract.

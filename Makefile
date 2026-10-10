@@ -1,4 +1,4 @@
-CC := gcc
+CC := gcc-14
 BASE_CFLAGS := -std=c23 -Wall -Wextra -Werror -g -O1 -Iinclude -Itests
 # test builds route rb_malloc/rb_free through the fault injector
 CFLAGS := $(BASE_CFLAGS) -DRB_FAULT_INJECT
