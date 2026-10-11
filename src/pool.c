@@ -46,6 +46,7 @@ int pool_geometry(size_t obj_size, struct pool_geom *g) {
 
 #ifndef NDEBUG
 #include <assert.h>
+#include <string.h>
 /* Debug-build check of the pool's bookkeeping, run after every operation:
  * every slot of every slab is exactly one of live, free-listed, uncarved. */
 static void pool_check(const rb_pool_t *p) {
@@ -70,6 +71,38 @@ static void pool_check(const rb_pool_t *p) {
 #define POOL_CHECK(p) ((void)0)
 #endif
 
+/* ---- The free list: the only code that reads or writes a dead slot ----
+ * A dead slot's first sizeof(struct free_slot) bytes hold the raw link.
+ * Debug builds fill the rest of the stride with POOL_POISON_BYTE, so a
+ * stale reader of the old object sees impossible data, not the old node. */
+
+static void freelist_push(rb_pool_t *p, void *obj) {
+    struct free_slot *f = obj;
+#ifndef NDEBUG
+    memset(obj, POOL_POISON_BYTE, p->geom.stride);   /* fill the dead slot first */
+#endif
+    f->next = p->free_list;                          /* then the bytes that must stay meaningful */
+    p->free_list = f;
+    p->nfree_list++;
+}
+
+static void *freelist_pop(rb_pool_t *p) {
+    struct free_slot *f = p->free_list;
+    struct free_slot *next = f->next;
+#ifndef NDEBUG
+    const unsigned char *b = (const unsigned char *)f;
+    /* invariant: b[sizeof *f .. i) are still poison, so nothing wrote after free */
+    for (size_t i = sizeof *f; i < p->geom.stride; i++) {
+        assert(b[i] == POOL_POISON_BYTE && "write to a freed pool slot");
+    }
+    assert(((uintptr_t)next % POOL_ALIGN == 0) && "corrupt free-list link");
+    memset(f, POOL_POISON_BYTE, sizeof *f);   /* hand out a slot that is all poison */
+#endif
+    p->free_list = next;
+    p->nfree_list--;
+    return f;
+}
+
 rb_pool_t *pool_create(size_t obj_size) {
     struct pool_geom g;
     if (pool_geometry(obj_size, &g) != 0) return NULL;
@@ -92,10 +125,7 @@ rb_pool_t *pool_create(size_t obj_size) {
 void *pool_alloc(rb_pool_t *p) {
     void *obj = NULL;
     if (p->free_list != NULL) {
-        struct free_slot *f = p->free_list;
-        p->free_list = f->next;
-        p->nfree_list--;
-        obj = f;
+        obj = freelist_pop(p);
     } else {
         if (p->uncarved == 0) {
             struct slab *s = rb_malloc(POOL_SLAB_SIZE);
@@ -118,11 +148,8 @@ out:
 
 void pool_free(rb_pool_t *p, void *obj) {
     if (obj == NULL) return;
-    struct free_slot *f = obj;
-    f->next = p->free_list;
-    p->free_list = f;
+    freelist_push(p, obj);
     p->nlive--;
-    p->nfree_list++;
     POOL_CHECK(p);
 }
 

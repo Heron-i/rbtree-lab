@@ -41,4 +41,9 @@ struct pool_geom {
  * overflows, or leaves no room for a single slot. */
 int pool_geometry(size_t obj_size, struct pool_geom *g);
 
+#ifndef NDEBUG
+/* debug builds fill dead slots with this, apart from the free-list link */
+#define POOL_POISON_BYTE 0xDDu
+#endif
+
 #endif

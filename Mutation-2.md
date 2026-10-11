@@ -324,3 +324,77 @@ Every other public function in the repo has its own test file: `test_create`, `t
 ### Still ahead (unchanged from Part 1)
 - Step 2: pooled-tree tests (pooled twins in `test_create` / `test_insert` / `test_delete`, plus pooled modes in the sweep and fuzz). They go in the existing files, not new ones.
 - Step 4: wire the pool into `src/rbtree.c` (key-first on the pooled path only).
+
+---
+
+# Part 3: Evening 5 — poisoning freed slots (debug builds)
+
+## Status (2026-10-11): poisoning complete
+Carving and the intrusive LIFO free list landed in Part 2. Tonight adds debug-build poisoning on top of them. The spec says: *"fill the dead slot first, then write the free-list link into the bytes that must remain meaningful."*
+
+### Why it is needed
+A slab is one live `malloc` block, so ASan and valgrind treat every byte of a dead slot as valid and initialized. Three bugs are invisible to them:
+- a stale read of a freed node
+- a write after free
+- reading uninitialized fields of a recycled slot, where valgrind sees the old node's bytes as "defined"
+
+Poison makes them visible:
+- **Stale read:** the fields past the link read as `0xDD…`. A stale `left`, `right` or `parent` pointer is `0xDDDDDDDDDDDDDDDD`, a non-canonical address, so dereferencing it faults.
+- **Write after free:** caught when the slot is popped.
+- **Uninitialized fields:** a recycled slot arrives all `0xDD`.
+
+### Decision: plain link, not XOR-encoded
+`pool_free` fills the whole stride with `POOL_POISON_BYTE` (`0xDD`), then writes the raw `next` pointer over the first 8 bytes, which is `rb_node.key`. This matches the spec: the link occupies "the bytes that must remain meaningful", and everything else is impossible data.
+- **Rejected alternative:** store `next ^ 0xDDDD…DD`, so a stale `n->key` would fault as well. It is a stronger check, but it goes beyond what the spec asks of poisoning, and it adds an encode/decode step to every link access.
+
+### Ownership of the link bytes
+Two static helpers in `src/pool.c` sit apart from the carving code. They are the only code that touches a dead slot.
+- **`freelist_push`:**
+  1. poison the full stride (debug builds only)
+  2. two stores: the link into the slot, and the new head
+- **`freelist_pop`:**
+  1. two loads: the head, and the link
+  2. debug builds only: assert that bytes `[8, stride)` are still `0xDD`, which catches a write after free; assert that `next` is NULL or `POOL_ALIGN`-aligned; overwrite the link bytes with `0xDD`
+- **Callers:** `pool_free` and `pool_alloc` keep the `nlive` updates and the `POOL_CHECK` placement.
+- **Not poisoned:** freshly carved slots, because valgrind already tracks them as undefined, and `pool_destroy`, because the slabs go back to `malloc`.
+
+### Known blind spots
+As the spec says, "this does not make every use-after-free magically detectable".
+- **A stale read of the link bytes (`n->key`) sees a real pointer.** It points to another dead slot, or it is NULL at the tail of the free list.
+- **A stale access after the slot has been reused** hits a live object. LIFO reuse keeps that window short.
+
+### Tests: `tests/test_pool_free.c` (PF-01..06), built as `build/test_pool_free`
+- **PF-01** `pool_free(NULL)` is a no-op.
+- **PF-02** Emptying a slab never shrinks the pool.
+- **PF-03** Reverse, forward and random free orders all come back as exactly the freed set, with 0 `rb_malloc`.
+- **PF-04 (redefined)** Last night's PF-04 said "bytes 8..obj_size untouched after free", which poisoning contradicts. It had not been written yet. It now checks that a freed slot holds the raw link (to the previous slot, or NULL at the tail), followed by poison through `stride`. That covers obj_size 1, 48 and 100, so the padding is included.
+- **PF-05** A popped slot is all poison.
+- **PF-06** Freeing a slot leaves its neighbours byte-for-byte intact. This includes the last slot of a slab with a tail.
+
+`check_stats` runs after every step. `check_stats`, `expect_stats` and `objs_per_slab_for` moved verbatim into `tests/pool_check.h`, which `test_pool.c` and `test_pool_free.c` both include.
+
+**Red, then green:** against the old `pool.c`, PF-04 and PF-05 failed on the poison bytes only, and everything else passed. A throwaway program that writes into a freed slot and then allocates aborts at `pool.c:96` (`freelist_pop`: "write to a freed pool slot").
+
+## Pool test-file layout (revised 2026-10-11; supersedes the "Approved 2026-10-10" table)
+| File | Status | Holds |
+|---|---|---|
+| `tests/test_pool_geom.c` | done | GEO-01..03 |
+| `tests/test_pool_free.c` | done | PF-01..06 |
+| `tests/test_pool_create.c` | later | PL-01, PL-02, PL-09, PC-05, plus destroy merged in: PL-07, PD-02, PD-03 |
+| `tests/test_pool_alloc.c` | later | PL-03, PL-05, PL-06, PL-08, PA-05..08 |
+| `tests/test_pool.c` | slim later | PL-04, PS-02, PS-03 (the `pool_stats` oracle and the invariant) |
+
+**Dropped:**
+- **PC-04:** duplicates GEO-01 and PA-08.
+- **PD-04:** duplicates PL-07's `pool_destroy(NULL)`.
+
+**No files for:**
+- **The free list:** tested through `pool_free` and `pool_alloc`.
+- **Poisoning:** split out a debug-only `test_pool_debug.c` only if a release test build is added.
+- **`pool_stats`:** it is the oracle.
+- **`pool_destroy`:** merged into `test_pool_create.c`.
+
+## Verification (gcc-14)
+- `make test` and `make asan` pass: every existing suite, the sweep at N=401 for A and B (reproduced), GEO 3/3, PL 9/9 and PF 6/6.
+- `make clean && make memcheck`: 0 errors and 0 bytes in use for all 13 binaries.
+- `pool.c` also compiles `-Werror` clean with `-DNDEBUG`.

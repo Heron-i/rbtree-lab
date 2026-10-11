@@ -27,8 +27,10 @@ POOLSRC := src/pool.c tests/fault_alloc.c tests/test_pool_geom.c
 POOLBIN := build/test_pool_geom
 PLSRC := src/pool.c tests/fault_alloc.c tests/test_pool.c
 PLBIN := build/test_pool
+PFSRC := src/pool.c tests/fault_alloc.c tests/test_pool_free.c
+PFBIN := build/test_pool_free
 POOLPRODOBJ := build/pool_prod.o
-all: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN) $(PRODOBJ) $(POOLPRODOBJ)
+all: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PRODOBJ) $(POOLPRODOBJ)
 # compile-only: keeps the production (malloc-forwarding) seam -Werror clean
 $(PRODOBJ): src/rbtree.c include/rbtree.h tests/fault_alloc.h
 	@mkdir -p build
@@ -39,9 +41,12 @@ $(POOLPRODOBJ): src/pool.c src/pool.h tests/fault_alloc.h
 $(POOLBIN): $(POOLSRC) src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc $(POOLSRC) -o $@
-$(PLBIN): $(PLSRC) src/pool.h tests/fault_alloc.h
+$(PLBIN): $(PLSRC) src/pool.h tests/fault_alloc.h tests/pool_check.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc $(PLSRC) -o $@
+$(PFBIN): $(PFSRC) src/pool.h tests/fault_alloc.h tests/pool_check.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc $(PFSRC) -o $@
 $(BIN): $(SRC) $(TSRC) include/rbtree.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(TSRC) -o $@
@@ -72,8 +77,8 @@ $(FUZZBIN): $(SRC) tests/fuzz.c include/rbtree.h tests/fault_alloc.h
 $(SWEEPBIN): $(SRC) tests/fault_sweep.c include/rbtree.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) tests/fault_sweep.c -o $@
-test: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN)
-	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(SWEEPBIN) && ./$(POOLBIN) && ./$(PLBIN)
+test: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN) $(PFBIN)
+	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(SWEEPBIN) && ./$(POOLBIN) && ./$(PLBIN) && ./$(PFBIN)
 asan: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: clean test
 memcheck: all
@@ -101,6 +106,8 @@ memcheck: all
 	--error-exitcode=1 ./$(POOLBIN)
 	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(PLBIN)
+	valgrind --leak-check=full --show-leak-kinds=all \
+	--error-exitcode=1 ./$(PFBIN)
 clean:
 	rm -rf build
 .PHONY: all test asan memcheck clean
