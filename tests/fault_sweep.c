@@ -15,7 +15,20 @@
 // Delete, overwrite and same-pointer re-insert must never allocate: each
 // runs under a live fault, must free exactly the right value (by serial),
 // and every value_free callback must see a fully consistent tree.
+// Pooled runs (M5 Mutation 2): A and B are swept a second time on a tree
+// from rb_create_pooled, whose create makes 2 allocations (tree, then pool).
+// A pooled new-key insert allocates the key copy first, then a node slot,
+// and the slot calls rb_malloc only when the pool has no free slot (a new
+// slab). So with rel as above the insert must fail iff rel < n <= rel+k,
+// where k = 2 if free_objs == 0 before the insert, else 1 -- at the key copy
+// if n == rel+1, at the slab if n == rel+2. Through the internal headers,
+// pooled runs also assert after every op that live + free_objs ==
+// slabs * objs_per_slab and live == rb_size, that a failed insert,
+// overwrite or same-pointer re-insert leaves the stats triple unchanged,
+// and that a delete is exactly live-1, free+1.
 #include "rbtree.h"
+#include "../src/rbtree_internal.h"
+#include "../src/pool.h"
 #include "fault_alloc.h"
 
 #include <stdbool.h>
@@ -32,6 +45,12 @@
 #define STRIDE 77            /* coprime to NKEYS, so perm() is a permutation */
 #define MAX_N 100000L        /* termination guard */
 #define EXPECTED_N (1L + 2L * NKEYS)
+/* pooled: 2 (tree + pool) + 1 key copy per key + 1 per slab. Slabs follow
+ * the peak live count, since deleted slots are reused before carving:
+ *   A: 200 live after the inserts      -> ceil(200/85) = 3 slabs
+ *   B: peaks at 200 - 48 deletes = 152 -> ceil(152/85) = 2 slabs */
+#define EXPECTED_N_POOLED_A (2L + NKEYS + 3L)
+#define EXPECTED_N_POOLED_B (2L + NKEYS + 2L)
 
 #define TVAL_MAGIC 0x7E57BEEFu
 #define TVAL_POISON 0xDEADDEADu
@@ -208,6 +227,8 @@ struct scenario {
     const char *name;
     struct op ops[MAX_OPS];
     size_t count;
+    bool pooled;        /* run on rb_create_pooled instead of rb_create */
+    long expected_n;    /* allocations of a clean run */
 };
 
 static void push_op(struct scenario *s, enum op_kind kind, int id) {
@@ -221,6 +242,8 @@ static void push_op(struct scenario *s, enum op_kind kind, int id) {
 static void build_scenario_a(struct scenario *s) {
     s->name = "A: insert 200, delete 100, overwrite 50";
     s->count = 0;
+    s->pooled = false;
+    s->expected_n = EXPECTED_N;
     for (int i = 0; i < NKEYS; i++) push_op(s, OP_INSERT, perm(i));
     for (int j = 0; j < NDELETE; j++) push_op(s, OP_DELETE, perm(2 * j));
     for (int j = 0; j < NOVERWRITE; j++) push_op(s, OP_OVERWRITE, perm(2 * j + 1));
@@ -229,6 +252,8 @@ static void build_scenario_a(struct scenario *s) {
 static void build_scenario_b(struct scenario *s) {
     s->name = "B: 50 interleaved rounds";
     s->count = 0;
+    s->pooled = false;
+    s->expected_n = EXPECTED_N;
     /* invariant: rounds < r inserted keys perm(0 .. PER_ROUND*r - 1) */
     for (int r = 0; r < NROUNDS; r++) {
         for (int k = 0; k < PER_ROUND; k++) push_op(s, OP_INSERT, perm(PER_ROUND * r + k));
@@ -240,6 +265,30 @@ static void build_scenario_b(struct scenario *s) {
     }
 }
 
+/* The same op list, swept on a pooled tree. */
+static void make_pooled(struct scenario *s, const struct scenario *from,
+                        const char *name, long expected_n) {
+    *s = *from;
+    s->name = name;
+    s->pooled = true;
+    s->expected_n = expected_n;
+}
+
+/* ---- pooled stats ---- */
+struct triple {
+    size_t slabs, live, free_objs;
+};
+
+static struct triple triple_of(const rbtree_t *t) {
+    struct triple x;
+    pool_stats(t->pool, &x.slabs, &x.live, &x.free_objs);
+    return x;
+}
+
+static bool triple_eq(struct triple a, struct triple b) {
+    return a.slabs == b.slabs && a.live == b.live && a.free_objs == b.free_objs;
+}
+
 /* ---- one scenario run with the n-th allocation armed ---- */
 struct run_result {
     bool ok;
@@ -249,6 +298,7 @@ struct run_result {
 };
 
 struct run_ctx {
+    bool pooled;
     rbtree_t *t;
     struct model m;
     long n;
@@ -277,6 +327,15 @@ static void do_new_insert(struct run_ctx *c, int id, const char *key) {
     long rel = fault_alloc_total() - c->t0;
     bool expect_fail = rel < c->n && c->n <= rel + 2;
     const char *site = (c->n == rel + 1) ? "node" : "key-copy";
+    struct triple st0 = {0};
+    bool slab_needed = false;
+    if (c->pooled) {
+        /* key copy first, then the slot; the slot allocates only for a new slab */
+        st0 = triple_of(c->t);
+        slab_needed = st0.free_objs == 0;
+        expect_fail = rel < c->n && c->n <= rel + (slab_needed ? 2 : 1);
+        site = (c->n == rel + 1) ? "key-copy" : "slab";
+    }
     struct tval *v = tval_new(id);
     struct before b = take_before(c->t, key);
     int rc = rb_insert(c->t, key, v);
@@ -285,6 +344,15 @@ static void do_new_insert(struct run_ctx *c, int id, const char *key) {
             fprintf(stderr, "    n=%ld: insert \"%s\" succeeded, expected %s allocation "
                     "failure\n", c->n, key, site);
             fail(c);
+        }
+        if (c->pooled) {
+            struct triple st1 = triple_of(c->t);
+            if (st1.live != st0.live + 1 || st1.slabs != st0.slabs + (slab_needed ? 1 : 0)) {
+                fprintf(stderr, "    n=%ld: pooled insert \"%s\" moved stats (%zu,%zu,%zu) -> "
+                        "(%zu,%zu,%zu)\n", c->n, key, st0.slabs, st0.live, st0.free_objs,
+                        st1.slabs, st1.live, st1.free_objs);
+                fail(c);
+            }
         }
         c->m.val[id] = v;
         c->m.count++;
@@ -301,6 +369,11 @@ static void do_new_insert(struct run_ctx *c, int id, const char *key) {
                 "\"%s\" (%s allocation)\n", c->n, key, site);
         fail(c);
     }
+    if (c->pooled && !triple_eq(triple_of(c->t), st0)) {
+        fprintf(stderr, "    n=%ld: pool stats changed by failed insert \"%s\" (%s allocation)\n",
+                c->n, key, site);
+        fail(c);
+    }
     tval_release(v);   /* caller still owns it; double free if the tree freed it */
 }
 
@@ -310,6 +383,7 @@ static void do_delete(struct run_ctx *c, int id, const char *key) {
     long old_serial = present ? old->serial : -1;
     long a0 = fault_alloc_total(), f0 = g_freed, b0 = g_bad_callbacks;
     g_last_freed_serial = -1;
+    struct triple st0 = c->pooled ? triple_of(c->t) : (struct triple){0};
 
     bool pending = live_fault_begin(c);
     g_check_tree = c->t;
@@ -333,6 +407,20 @@ static void do_delete(struct run_ctx *c, int id, const char *key) {
                 g_last_freed_serial, old_serial, present);
         fail(c);
     }
+    if (c->pooled) {
+        struct triple want = st0;
+        if (present) {
+            want.live--;
+            want.free_objs++;
+        }
+        struct triple got = triple_of(c->t);
+        if (!triple_eq(got, want)) {
+            fprintf(stderr, "    n=%ld: pooled rb_delete(\"%s\") stats (%zu,%zu,%zu), want "
+                    "(%zu,%zu,%zu)\n", c->n, key, got.slabs, got.live, got.free_objs,
+                    want.slabs, want.live, want.free_objs);
+            fail(c);
+        }
+    }
     if (present) {
         c->m.val[id] = NULL;
         c->m.count--;
@@ -345,6 +433,7 @@ static void do_overwrite(struct run_ctx *c, int id, const char *key) {
     struct tval *v = tval_new(id);
     long a0 = fault_alloc_total(), f0 = g_freed, b0 = g_bad_callbacks;
     g_last_freed_serial = -1;
+    struct triple st0 = c->pooled ? triple_of(c->t) : (struct triple){0};
 
     bool pending = live_fault_begin(c);
     g_check_tree = c->t;
@@ -368,11 +457,16 @@ static void do_overwrite(struct run_ctx *c, int id, const char *key) {
                 v->magic == TVAL_MAGIC, g_bad_callbacks == b0);
         fail(c);
     }
+    if (c->pooled && !triple_eq(triple_of(c->t), st0)) {
+        fprintf(stderr, "    n=%ld: overwrite of \"%s\" changed the pool stats\n", c->n, key);
+        fail(c);
+    }
     c->m.val[id] = v;
 }
 
 static void do_reinsert_same(struct run_ctx *c, const char *key, struct tval *v) {
     long a0 = fault_alloc_total(), f0 = g_freed, b0 = g_bad_callbacks;
+    struct triple st0 = c->pooled ? triple_of(c->t) : (struct triple){0};
 
     bool pending = live_fault_begin(c);
     g_check_tree = c->t;
@@ -387,19 +481,46 @@ static void do_reinsert_same(struct run_ctx *c, const char *key, struct tval *v)
                 c->n, key, rc, fault_alloc_total() - a0, g_freed - f0);
         fail(c);
     }
+    if (c->pooled && !triple_eq(triple_of(c->t), st0)) {
+        fprintf(stderr, "    n=%ld: same-pointer re-insert of \"%s\" changed the pool stats\n",
+                c->n, key);
+        fail(c);
+    }
+}
+
+/* Pooled only, after every op: every slot is live, free-listed or uncarved,
+ * and the live slots are exactly the tree's nodes. */
+static void check_pool_after_op(struct run_ctx *c, size_t op) {
+    static size_t per;
+    if (per == 0) {
+        struct pool_geom g;
+        if (pool_geometry(sizeof(struct rb_node), &g) == 0) per = g.objs_per_slab;
+    }
+    struct triple x = triple_of(c->t);
+    if (x.live + x.free_objs != x.slabs * per || x.live != rb_size(c->t)) {
+        fprintf(stderr, "    n=%ld op %zu: pool stats (%zu,%zu,%zu) break the invariant "
+                "(objs_per_slab %zu, rb_size %zu)\n", c->n, op, x.slabs, x.live,
+                x.free_objs, per, rb_size(c->t));
+        fail(c);
+    }
 }
 
 static struct run_result run_scenario(const struct scenario *s, long n) {
-    struct run_ctx c = {.n = n, .r = {.ok = true}};
+    struct run_ctx c = {.pooled = s->pooled, .n = n, .r = {.ok = true}};
     c.t0 = fault_alloc_total();
     long freed0 = g_freed;
     fault_alloc_arm(n);
 
-    c.t = rb_create(counting_free);
+    c.t = s->pooled ? rb_create_pooled(counting_free) : rb_create(counting_free);
     if (c.t == NULL) {
         c.r.failures++;
-        if (n != 1) {
+        if (!s->pooled && n != 1) {
             fprintf(stderr, "    n=%ld: rb_create failed, expected only at n=1\n", n);
+            fail(&c);
+        }
+        if (s->pooled && n > 2) {
+            fprintf(stderr, "    n=%ld: rb_create_pooled failed, expected only at n=1 "
+                    "(tree) or n=2 (pool)\n", n);
             fail(&c);
         }
         if (g_freed != freed0) {
@@ -431,6 +552,7 @@ static struct run_result run_scenario(const struct scenario *s, long n) {
             if (cur != NULL) do_reinsert_same(&c, key, cur);
             break;
         }
+        if (c.pooled) check_pool_after_op(&c, i);
     }
 
     if (rb_validate(c.t) != 0 || rb_size(c.t) != c.m.count || !model_matches(c.t, &c.m)) {
@@ -484,9 +606,9 @@ static bool sweep(const struct scenario *s) {
         fprintf(stderr, "FAIL [%s]: N == 0, injector not wired (rbtree.c bypasses "
                 "rb_malloc)\n", s->name);
         ok = false;
-    } else if (total_n != EXPECTED_N) {
+    } else if (total_n != s->expected_n) {
         fprintf(stderr, "FAIL [%s]: N = %ld allocations, expected %ld\n",
-                s->name, total_n, EXPECTED_N);
+                s->name, total_n, s->expected_n);
         ok = false;
     }
     if (again.fault_fired || again.allocs != total_n || !again.ok) {
@@ -512,10 +634,14 @@ int main(void) {
         fprintf(stderr, "FAIL: assert_unchanged self-test\n");
         return EXIT_FAILURE;
     }
-    static struct scenario a, b;
+    static struct scenario a, b, pa, pb;
     build_scenario_a(&a);
     build_scenario_b(&b);
+    make_pooled(&pa, &a, "pooled A: insert 200, delete 100, overwrite 50", EXPECTED_N_POOLED_A);
+    make_pooled(&pb, &b, "pooled B: 50 interleaved rounds", EXPECTED_N_POOLED_B);
     bool ok_a = sweep(&a);
     bool ok_b = sweep(&b);
-    return (ok_a && ok_b) ? EXIT_SUCCESS : EXIT_FAILURE;
+    bool ok_pa = sweep(&pa);
+    bool ok_pb = sweep(&pb);
+    return (ok_a && ok_b && ok_pa && ok_pb) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

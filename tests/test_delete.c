@@ -36,8 +36,13 @@
 // *and* the node struct itself -- neither leaks, since rb_destroy(t) only
 // owns nodes that were actually linked into t (they aren't yet, at that
 // point).
+// RBD-20 (M5 Mutation 2) covers the pooled tree: delete hands the node's
+// slot back to the pool without allocating, and the next new key reuses
+// that exact slot.
 #include "rbtree.h"
 #include "../src/rbtree_internal.h"
+#include "../src/pool.h"
+#include "fault_alloc.h"   /* test-build fault injector behind rb_malloc */
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -1095,6 +1100,81 @@ static bool test_rbd19_value_free_sees_committed_tree(void) {
     return ok;
 }
 
+/* ---- RBD-20: a pooled delete returns the node's slot to the pool and
+ * allocates nothing; the next new key reuses that slot (LIFO) and makes
+ * exactly one allocation, its key copy ---- */
+static struct rb_node *node_for(const struct rbtree *t, const char *key) {
+    struct rb_node *n = t->root;
+    /* invariant: if key is present, it lies within the subtree rooted at n */
+    while (n != &t->nil) {
+        int cmp = strcmp(key, n->key);
+        if (cmp == 0) return n;
+        n = (cmp < 0) ? n->left : n->right;
+    }
+    return NULL;
+}
+
+static bool expect_pool(const struct rbtree *t, const char *where,
+                        size_t want_slabs, size_t want_live, size_t want_free) {
+    size_t slabs, live, free_objs;
+    pool_stats(t->pool, &slabs, &live, &free_objs);
+    if (slabs != want_slabs || live != want_live || free_objs != want_free) {
+        fprintf(stderr, "    %s: pool stats (%zu,%zu,%zu), want (%zu,%zu,%zu)\n",
+                where, slabs, live, free_objs, want_slabs, want_live, want_free);
+        return false;
+    }
+    return true;
+}
+
+static bool test_rbd20_pooled_delete_returns_slot(void) {
+    rbtree_t *t = rb_create_pooled(free_recorder);
+    if (!t) {
+        fprintf(stderr, "    rb_create_pooled(free_recorder) returned NULL, cannot build tree\n");
+        return false;
+    }
+    static int tag_a, tag_b, tag_c, tag_d;
+    const char *keys[] = {"50", "25", "75"};
+    void *values[] = {&tag_a, &tag_b, &tag_c};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (rb_insert(t, keys[i], values[i]) != 0) {
+            fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
+            rb_destroy(t);
+            return false;
+        }
+    }
+    bool ok = expect_pool(t, "RBD-20 built", 1, 3, 82);
+    struct rb_node *slot = node_for(t, "25");
+
+    free_recorder_reset();
+    long a0 = fault_alloc_total();
+    fault_alloc_arm(1);
+    int rc = rb_delete(t, "25");
+    long allocs = fault_alloc_total() - a0;
+    fault_alloc_disarm();
+    if (rc != 0 || allocs != 0 || free_recorder_count != 1 || !free_recorder_saw(&tag_b) ||
+        rb_validate(t) != 0) {
+        fprintf(stderr, "    pooled rb_delete(\"25\") under fault_alloc_arm(1): rc=%d (want 0), "
+                "allocations=%ld (want 0), value_free calls=%d (want 1, of 25's value)\n",
+                rc, allocs, free_recorder_count);
+        ok = false;
+    }
+    ok = expect_pool(t, "RBD-20 after delete", 1, 2, 83) && ok;
+
+    long a1 = fault_alloc_total();
+    rc = rb_insert(t, "10", &tag_d);
+    long allocs2 = fault_alloc_total() - a1;
+    struct rb_node *reused = node_for(t, "10");
+    if (rc != 0 || allocs2 != 1 || reused != slot) {
+        fprintf(stderr, "    pooled rb_insert(\"10\") after the delete: rc=%d (want 0), "
+                "allocations=%ld (want 1, the key copy), node %p (want freed slot %p)\n",
+                rc, allocs2, (void *)reused, (void *)slot);
+        ok = false;
+    }
+    ok = expect_pool(t, "RBD-20 after re-insert", 1, 3, 82) && ok;
+    rb_destroy(t);
+    return ok;
+}
+
 typedef struct {
     const char *id;
     const char *name;
@@ -1133,16 +1213,32 @@ static const test_case_t tests[] = {
      test_rbd18_deep_successor_splice},
     {"RBD-19", "value_free sees a committed, consistent tree",
      test_rbd19_value_free_sees_committed_tree},
+    {"RBD-20", "pooled delete returns the slot; next insert reuses it",
+     test_rbd20_pooled_delete_returns_slot},
 };
 
 int main(void) {
     size_t total = sizeof(tests) / sizeof(tests[0]);
     size_t passed = 0;
+#ifdef RB_POOLED_BUILD
+    size_t na = 0;   /* declared N/A on the pooled build (tests/pooled_build.h) */
+    if (!POOLED_NA_VERIFY(tests, total)) return EXIT_FAILURE;
+#endif
     for (size_t i = 0; i < total; i++) {
+#ifdef RB_POOLED_BUILD
+        if (pooled_na_report(__FILE__, tests[i].id)) {
+            na++;
+            continue;
+        }
+#endif
         bool ok = tests[i].run();
         printf("[%s] %-55s %s\n", tests[i].id, tests[i].name, ok ? "PASS" : "FAIL");
         if (ok) passed++;
     }
+#ifdef RB_POOLED_BUILD
+    total -= na;
+    printf("%zu declared N/A on the pooled build\n", na);
+#endif
     printf("%zu/%zu tests passed\n", passed, total);
     return (passed == total) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

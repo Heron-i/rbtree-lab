@@ -25,6 +25,7 @@ struct rbtree {
                                * rb_delete's transplant/delete_fixup only */
     size_t size;
     rb_value_free_fn value_free;
+    struct rb_pool *pool;     /* node storage; NULL unless rb_create_pooled */
 };
 
 #endif

@@ -29,6 +29,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   approval before editing.
   - build tests first always, then implementation.
   - Commit only from a green state; message format "M<n>: <what>".
+  - An N/A line marks a test written for the plain rb_create tree that depends on how that tree allocates its nodes. The pooled build changes that allocator underneath it, so in the pooled build the test's result wouldn't tell you anything about the tree.
 
   ## Code map (→ = depends on / calls)
 - include/rbtree.h ← src/rbtree.c ← tests/*.c

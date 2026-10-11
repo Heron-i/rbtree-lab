@@ -148,6 +148,10 @@ out:
 
 void pool_free(rb_pool_t *p, void *obj) {
     if (obj == NULL) return;
+#ifndef NDEBUG
+    /* unsigned counts would wrap and still satisfy POOL_CHECK's sum */
+    assert(p->nlive > 0 && "pool_free with no live objects (double or foreign free)");
+#endif
     freelist_push(p, obj);
     p->nlive--;
     POOL_CHECK(p);

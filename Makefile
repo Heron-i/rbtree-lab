@@ -2,7 +2,8 @@ CC := gcc-14
 BASE_CFLAGS := -std=c23 -Wall -Wextra -Werror -g -O1 -Iinclude -Itests
 # test builds route rb_malloc/rb_free through the fault injector
 CFLAGS := $(BASE_CFLAGS) -DRB_FAULT_INJECT
-SRC := src/rbtree.c tests/fault_alloc.c
+# every tree binary links the pool (rb_create_pooled)
+SRC := src/rbtree.c src/pool.c tests/fault_alloc.c
 TSRC := tests/test_rbtree.c
 DTSRC := tests/test_delete.c
 CRSRC := tests/test_create.c
@@ -34,9 +35,13 @@ PCBIN := build/test_pool_create
 PASRC := src/pool.c tests/fault_alloc.c tests/test_pool_alloc.c
 PABIN := build/test_pool_alloc
 POOLPRODOBJ := build/pool_prod.o
-all: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PCBIN) $(PABIN) $(PRODOBJ) $(POOLPRODOBJ)
+# pooled build: the tree battery again, test sources unchanged, with
+# rb_create mapped to rb_create_pooled in the test TU only
+POOLED_TESTS := test_rbtree test_delete test_create test_destroy test_find test_foreach test_insert test_size
+POOLEDBINS := $(addprefix build/pooled/,$(POOLED_TESTS))
+all: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PCBIN) $(PABIN) $(POOLEDBINS) $(PRODOBJ) $(POOLPRODOBJ)
 # compile-only: keeps the production (malloc-forwarding) seam -Werror clean
-$(PRODOBJ): src/rbtree.c include/rbtree.h tests/fault_alloc.h
+$(PRODOBJ): src/rbtree.c include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(BASE_CFLAGS) -c src/rbtree.c -o $@
 $(POOLPRODOBJ): src/pool.c src/pool.h tests/fault_alloc.h
@@ -57,38 +62,44 @@ $(PCBIN): $(PCSRC) src/pool.h tests/fault_alloc.h tests/pool_check.h
 $(PABIN): $(PASRC) src/pool.h tests/fault_alloc.h tests/pool_check.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc $(PASRC) -o $@
-$(BIN): $(SRC) $(TSRC) include/rbtree.h tests/fault_alloc.h
+# the mapping header must reach only the test file, so it is compiled alone
+build/pooled/%: tests/%.c $(SRC) include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h tests/pooled_build.h
+	@mkdir -p build/pooled
+	$(CC) $(CFLAGS) -include tests/pooled_build.h -c $< -o $@.o
+	$(CC) $(CFLAGS) $(SRC) $@.o -o $@
+$(BIN): $(SRC) $(TSRC) include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(TSRC) -o $@
-$(DBIN): $(SRC) $(DTSRC) include/rbtree.h tests/fault_alloc.h
+$(DBIN): $(SRC) $(DTSRC) include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(DTSRC) -o $@
-$(CRBIN): $(SRC) $(CRSRC) include/rbtree.h tests/fault_alloc.h
+$(CRBIN): $(SRC) $(CRSRC) include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(CRSRC) -o $@
-$(DEBIN): $(SRC) $(DESRC) include/rbtree.h tests/fault_alloc.h
+$(DEBIN): $(SRC) $(DESRC) include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(DESRC) -o $@
-$(FIBIN): $(SRC) $(FISRC) include/rbtree.h tests/fault_alloc.h
+$(FIBIN): $(SRC) $(FISRC) include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(FISRC) -o $@
-$(FEBIN): $(SRC) $(FESRC) include/rbtree.h tests/fault_alloc.h
+$(FEBIN): $(SRC) $(FESRC) include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(FESRC) -o $@
-$(INBIN): $(SRC) $(INSRC) include/rbtree.h tests/fault_alloc.h
+$(INBIN): $(SRC) $(INSRC) include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(INSRC) -o $@
-$(SIBIN): $(SRC) $(SISRC) include/rbtree.h tests/fault_alloc.h
+$(SIBIN): $(SRC) $(SISRC) include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) $(SISRC) -o $@
-$(FUZZBIN): $(SRC) tests/fuzz.c include/rbtree.h tests/fault_alloc.h
+$(FUZZBIN): $(SRC) tests/fuzz.c include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) tests/fuzz.c -o $@
-$(SWEEPBIN): $(SRC) tests/fault_sweep.c include/rbtree.h tests/fault_alloc.h
+$(SWEEPBIN): $(SRC) tests/fault_sweep.c include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) tests/fault_sweep.c -o $@
-test: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PCBIN) $(PABIN)
-	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(SWEEPBIN) && ./$(POOLBIN) && ./$(PLBIN) && ./$(PFBIN) && ./$(PCBIN) && ./$(PABIN)
+test: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PCBIN) $(PABIN) $(POOLEDBINS)
+	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(FUZZBIN) 100000 12648430 pooled && ./$(SWEEPBIN) && ./$(POOLBIN) && ./$(PLBIN) && ./$(PFBIN) && ./$(PCBIN) && ./$(PABIN)
+	@for b in $(POOLEDBINS); do echo "== pooled build: $$b"; ./$$b || exit 1; done
 asan: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: clean test
 memcheck: all
@@ -111,6 +122,8 @@ memcheck: all
 	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(FUZZBIN) 20000
 	valgrind --leak-check=full --show-leak-kinds=all \
+	--error-exitcode=1 ./$(FUZZBIN) 100000 12648430 pooled
+	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(SWEEPBIN)
 	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(POOLBIN)
@@ -122,6 +135,8 @@ memcheck: all
 	--error-exitcode=1 ./$(PCBIN)
 	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(PABIN)
+	for b in $(POOLEDBINS); do valgrind --leak-check=full --show-leak-kinds=all \
+	--error-exitcode=1 ./$$b || exit 1; done
 clean:
 	rm -rf build
 .PHONY: all test asan memcheck clean

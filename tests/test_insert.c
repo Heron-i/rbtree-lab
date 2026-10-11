@@ -23,8 +23,14 @@
 // RBI-17 checks it for an overwrite with the SAME value pointer, and also
 // that the tree does not release a value it still owns. Deferred: a
 // mirrored recolor case and a fixed shuffled-order stress case.
+// RBI-06P/07P/15P/16P/17P (M5 Mutation 2) are pooled twins of the five
+// allocation-failure tests. A pooled new-key insert allocates the key copy
+// FIRST, then a node slot from the pool; the slot needs rb_malloc only when
+// the pool has no free slot (a new slab). Each twin also asserts that the
+// pool's stats triple is unchanged by the failed (or non-allocating) call.
 #include "rbtree.h"
 #include "../src/rbtree_internal.h"
+#include "../src/pool.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -63,7 +69,7 @@ static bool free_recorder_saw(void *value) {
  * keys) so a failed insert can be proven byte-for-byte unchanged, not just
  * "still validates" -- see the plan's rationale (a partially-applied
  * fixup could still produce a different, still-valid tree). */
-#define SNAPSHOT_CAP 8
+#define SNAPSHOT_CAP 128
 struct node_snapshot {
     const struct rb_node *self;
     const struct rb_node *left;
@@ -684,6 +690,237 @@ static bool test_rbi17_reinsert_same_value_not_freed(void) {
     return ok;
 }
 
+/* ---- Pooled twins (M5 Mutation 2) ---- */
+
+struct triple { size_t slabs, live, free_objs; };
+
+static struct triple pool_triple(const struct rbtree *t) {
+    struct triple x;
+    pool_stats(t->pool, &x.slabs, &x.live, &x.free_objs);
+    return x;
+}
+
+static bool triple_eq(struct triple a, struct triple b) {
+    return a.slabs == b.slabs && a.live == b.live && a.free_objs == b.free_objs;
+}
+
+/* Builds a pooled tree holding keys "k000".."k(n-1)"; NULL on failure. */
+static rbtree_t *pooled_tree_with(int n) {
+    rbtree_t *t = rb_create_pooled(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create_pooled(NULL) returned NULL, cannot build tree\n");
+        return NULL;
+    }
+    /* invariant: keys k000..k(i-1) are in the tree */
+    for (int i = 0; i < n; i++) {
+        char key[16];   /* room for any int, so -Wformat-truncation stays quiet */
+        snprintf(key, sizeof key, "k%03d", i);
+        if (rb_insert(t, key, NULL) != 0) {
+            fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", key);
+            rb_destroy(t);
+            return NULL;
+        }
+    }
+    return t;
+}
+
+/* ---- RBI-06P: pooled twin of RBI-06. The key copy (allocation #1) fails
+ * on an empty pooled tree: tree stays empty, pool still holds no slab ---- */
+static bool test_rbi06p_pooled_alloc_failure_empty_tree(void) {
+    rbtree_t *t = rb_create_pooled(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create_pooled(NULL) returned NULL, cannot build tree\n");
+        return false;
+    }
+    static int tag;
+    fault_alloc_arm(1);
+    int rc = rb_insert(t, "10", &tag);
+    fault_alloc_disarm();
+    struct triple after = pool_triple(t);
+    bool ok = (rc == -1) && (t->root == &t->nil) && (t->size == 0) &&
+              triple_eq(after, (struct triple){0, 0, 0});
+    if (!ok) {
+        fprintf(stderr,
+                "    pooled rb_insert(\"10\") with fault_alloc_arm(1) on empty tree: rc=%d "
+                "(want -1), root=%p (want nil=%p), size=%zu (want 0), stats (%zu,%zu,%zu) "
+                "(want (0,0,0))\n", rc, (void *)t->root, (void *)&t->nil, t->size,
+                after.slabs, after.live, after.free_objs);
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBI-07P: pooled twin of RBI-07. The key copy fails on a non-empty
+ * pooled tree: byte-for-byte unchanged, pool untouched ---- */
+static bool test_rbi07p_pooled_alloc_failure_nonempty_tree(void) {
+    rbtree_t *t = rb_create_pooled(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create_pooled(NULL) returned NULL, cannot build tree\n");
+        return false;
+    }
+    static int tag_a, tag_b, tag_c;
+    const char *keys[] = {"50", "25", "75"};
+    void *values[] = {&tag_a, &tag_b, &tag_c};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (rb_insert(t, keys[i], values[i]) != 0) {
+            fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", keys[i]);
+            rb_destroy(t);
+            return false;
+        }
+    }
+    struct rb_node *root_before = t->root;
+    size_t size_before = t->size;
+    struct snapshot_ctx before = {0};
+    snapshot_walk(t, t->root, &before);
+    struct triple stats_before = pool_triple(t);
+
+    static int tag_new;
+    fault_alloc_arm(1);
+    int rc = rb_insert(t, "10", &tag_new);
+    fault_alloc_disarm();
+
+    struct snapshot_ctx after = {0};
+    snapshot_walk(t, t->root, &after);
+    struct triple stats_after = pool_triple(t);
+    bool ok = (rc == -1) && (t->root == root_before) && (t->size == size_before) &&
+              snapshots_equal(&before, &after) &&
+              triple_eq(stats_before, (struct triple){1, 3, 82}) &&
+              triple_eq(stats_after, stats_before);
+    if (!ok) {
+        fprintf(stderr,
+                "    pooled rb_insert(\"10\") with fault_alloc_arm(1): rc=%d (want -1), root "
+                "unchanged=%d, size=%zu (want %zu), snapshot unchanged=%d, stats (%zu,%zu,%zu) "
+                "-> (%zu,%zu,%zu) (want (1,3,82) unchanged)\n",
+                rc, t->root == root_before, t->size, size_before,
+                snapshots_equal(&before, &after), stats_before.slabs, stats_before.live,
+                stats_before.free_objs, stats_after.slabs, stats_after.live,
+                stats_after.free_objs);
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBI-15P: pooled twin of RBI-15. The second allocation fails after
+ * the first succeeded; in pooled order that is the key copy succeeding and
+ * the new slab failing. 85 nodes fill slab 1 exactly, so the next insert
+ * must grow. The key copy must be released (asan/memcheck catch a leak),
+ * the tree left byte-for-byte unchanged and the pool not grown. ---- */
+static bool test_rbi15p_pooled_slab_alloc_failure(void) {
+    rbtree_t *t = pooled_tree_with(85);
+    if (!t) return false;
+    struct rb_node *root_before = t->root;
+    size_t size_before = t->size;
+    struct snapshot_ctx before = {0};
+    snapshot_walk(t, t->root, &before);
+    struct triple stats_before = pool_triple(t);
+
+    static int tag_new;
+    long a0 = fault_alloc_total();
+    fault_alloc_arm(2);   /* #1 = key copy succeeds, #2 = new slab fails */
+    int rc = rb_insert(t, "zzz", &tag_new);
+    fault_alloc_disarm();
+    long allocs = fault_alloc_total() - a0;
+
+    struct snapshot_ctx after = {0};
+    snapshot_walk(t, t->root, &after);
+    struct triple stats_after = pool_triple(t);
+    bool ok = (rc == -1) && (allocs == 2) && (t->root == root_before) &&
+              (t->size == size_before) && snapshots_equal(&before, &after) &&
+              triple_eq(stats_before, (struct triple){1, 85, 0}) &&
+              triple_eq(stats_after, stats_before);
+    if (!ok) {
+        fprintf(stderr,
+                "    pooled rb_insert(\"zzz\") with fault_alloc_arm(2) (slab fails): rc=%d "
+                "(want -1), allocations=%ld (want 2), root unchanged=%d, size=%zu (want %zu), "
+                "snapshot unchanged=%d, stats (%zu,%zu,%zu) -> (%zu,%zu,%zu) "
+                "(want (1,85,0) unchanged)\n",
+                rc, allocs, t->root == root_before, t->size, size_before,
+                snapshots_equal(&before, &after), stats_before.slabs, stats_before.live,
+                stats_before.free_objs, stats_after.slabs, stats_after.live,
+                stats_after.free_objs);
+    }
+    /* the pool recovers: the same insert now grows to slab 2 */
+    rc = rb_insert(t, "zzz", &tag_new);
+    struct triple grown = pool_triple(t);
+    if (rc != 0 || !triple_eq(grown, (struct triple){2, 86, 84}) || rb_validate(t) != 0) {
+        fprintf(stderr, "    retry after slab fault: rc=%d, stats (%zu,%zu,%zu) (want (2,86,84))\n",
+                rc, grown.slabs, grown.live, grown.free_objs);
+        ok = false;
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBI-16P: pooled twin of RBI-16. Overwrite allocates nothing, so it
+ * succeeds under an armed fault and leaves the pool untouched ---- */
+static bool test_rbi16p_pooled_overwrite_does_not_allocate(void) {
+    rbtree_t *t = rb_create_pooled(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create_pooled(NULL) returned NULL, cannot build tree\n");
+        return false;
+    }
+    static int tag_old, tag_new;
+    if (rb_insert(t, "10", &tag_old) != 0) {
+        fprintf(stderr, "    rb_insert(\"10\", old) failed while building the tree\n");
+        rb_destroy(t);
+        return false;
+    }
+    struct triple stats_before = pool_triple(t);
+    fault_alloc_arm(1);
+    long allocs_before = fault_alloc_total();
+    int rc = rb_insert(t, "10", &tag_new);
+    long allocs = fault_alloc_total() - allocs_before;
+    fault_alloc_disarm();
+    struct triple stats_after = pool_triple(t);
+    bool ok = (rc == 0) && (allocs == 0) && (rb_find(t, "10") == &tag_new) &&
+              triple_eq(stats_after, stats_before);
+    if (!ok) {
+        fprintf(stderr,
+                "    pooled overwrite \"10\" with fault_alloc_arm(1): rc=%d (want 0), "
+                "allocations=%ld (want 0), value updated=%d, stats unchanged=%d\n",
+                rc, allocs, rb_find(t, "10") == &tag_new, triple_eq(stats_after, stats_before));
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBI-17P: pooled twin of RBI-17. Same-pointer re-insert allocates
+ * nothing, releases nothing, and leaves the pool untouched ---- */
+static bool test_rbi17p_pooled_reinsert_same_value_not_freed(void) {
+    rbtree_t *t = rb_create_pooled(free_recorder);
+    if (!t) {
+        fprintf(stderr, "    rb_create_pooled(free_recorder) returned NULL, cannot build tree\n");
+        return false;
+    }
+    static int tag;
+    if (rb_insert(t, "10", &tag) != 0) {
+        fprintf(stderr, "    rb_insert(\"10\") failed while building the tree\n");
+        rb_destroy(t);
+        return false;
+    }
+    struct triple stats_before = pool_triple(t);
+    free_recorder_reset();
+    fault_alloc_arm(1);
+    long allocs_before = fault_alloc_total();
+    int rc = rb_insert(t, "10", &tag);
+    long allocs = fault_alloc_total() - allocs_before;
+    fault_alloc_disarm();
+    struct triple stats_after = pool_triple(t);
+    bool ok = (rc == 0) && (allocs == 0) && (free_recorder_count == 0) &&
+              (rb_find(t, "10") == &tag) && (rb_size(t) == 1) && (rb_validate(t) == 0) &&
+              triple_eq(stats_after, stats_before);
+    if (!ok) {
+        fprintf(stderr,
+                "    pooled re-insert \"10\" with its own value under fault_alloc_arm(1): rc=%d "
+                "(want 0), allocations=%ld (want 0), value_free calls=%d (want 0), "
+                "find returns same value=%d, size=%zu (want 1), stats unchanged=%d\n",
+                rc, allocs, free_recorder_count, rb_find(t, "10") == &tag, rb_size(t),
+                triple_eq(stats_after, stats_before));
+    }
+    rb_destroy(t);
+    return ok;
+}
+
 typedef struct {
     const char *id;
     const char *name;
@@ -713,16 +950,40 @@ static const test_case_t tests[] = {
     {"RBI-16", "overwrite performs no allocation", test_rbi16_overwrite_does_not_allocate},
     {"RBI-17", "re-insert with the same value pointer does not free it",
      test_rbi17_reinsert_same_value_not_freed},
+    {"RBI-06P", "pooled: key-copy failure on an empty tree",
+     test_rbi06p_pooled_alloc_failure_empty_tree},
+    {"RBI-07P", "pooled: key-copy failure leaves tree and pool unchanged",
+     test_rbi07p_pooled_alloc_failure_nonempty_tree},
+    {"RBI-15P", "pooled: slab failure after key copy leaves all unchanged",
+     test_rbi15p_pooled_slab_alloc_failure},
+    {"RBI-16P", "pooled: overwrite performs no allocation",
+     test_rbi16p_pooled_overwrite_does_not_allocate},
+    {"RBI-17P", "pooled: same-pointer re-insert does not free it",
+     test_rbi17p_pooled_reinsert_same_value_not_freed},
 };
 
 int main(void) {
     size_t total = sizeof(tests) / sizeof(tests[0]);
     size_t passed = 0;
+#ifdef RB_POOLED_BUILD
+    size_t na = 0;   /* declared N/A on the pooled build (tests/pooled_build.h) */
+    if (!POOLED_NA_VERIFY(tests, total)) return EXIT_FAILURE;
+#endif
     for (size_t i = 0; i < total; i++) {
+#ifdef RB_POOLED_BUILD
+        if (pooled_na_report(__FILE__, tests[i].id)) {
+            na++;
+            continue;
+        }
+#endif
         bool ok = tests[i].run();
         printf("[%s] %-55s %s\n", tests[i].id, tests[i].name, ok ? "PASS" : "FAIL");
         if (ok) passed++;
     }
+#ifdef RB_POOLED_BUILD
+    total -= na;
+    printf("%zu declared N/A on the pooled build\n", na);
+#endif
     printf("%zu/%zu tests passed\n", passed, total);
     return (passed == total) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

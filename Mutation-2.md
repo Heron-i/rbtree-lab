@@ -1,6 +1,6 @@
 # M5 Mutation 2: the slab is storage, the free list is policy
 
-> The design (Decisions 1-3, the answers and steps 0-5) is **approved**. On exiting plan mode this file is saved as `Mutation-2.md` in the repo root. Tonight's implementation scope is the "Evening 4 scope" section near the end.
+> **Status:** complete. Decisions 1-3 are approved and implemented. Parts 1-5 below are a dated log, kept as written at the time: geometry → pool → poisoning → pooled tree → the pooled-build battery. The current state is Part 5's verification at the end.
 
 ## Context
 `include/rbtree.h` declares `rb_create_pooled`, but nothing implements it yet. Today [src/pool.c](src/pool.c) holds only the API: `pool_create / pool_alloc / pool_free / pool_stats / pool_destroy`. Its comments add these constraints:
@@ -380,9 +380,9 @@ As the spec says, "this does not make every use-after-free magically detectable"
 |---|---|---|
 | `tests/test_pool_geom.c` | done | GEO-01..03 |
 | `tests/test_pool_free.c` | done | PF-01..06 |
-| `tests/test_pool_create.c` | later | PL-01, PL-02, PL-09, PC-05, plus destroy merged in: PL-07, PD-02, PD-03 |
-| `tests/test_pool_alloc.c` | later | PL-03, PL-05, PL-06, PL-08, PA-05..08 |
-| `tests/test_pool.c` | slim later | PL-04, PS-02, PS-03 (the `pool_stats` oracle and the invariant) |
+| `tests/test_pool_create.c` | done (Part 4) | PL-01, PL-02, PL-09, PC-05, plus destroy merged in: PL-07, PD-02, PD-03 |
+| `tests/test_pool_alloc.c` | done (Part 4) | PL-03, PL-05, PL-06, PL-08, PA-05..08 |
+| `tests/test_pool.c` | slimmed (Part 4) | PL-04, PS-02, PS-03 (the `pool_stats` oracle and the invariant) |
 
 **Dropped:**
 - **PC-04:** duplicates GEO-01 and PA-08.
@@ -398,3 +398,123 @@ As the spec says, "this does not make every use-after-free magically detectable"
 - `make test` and `make asan` pass: every existing suite, the sweep at N=401 for A and B (reproduced), GEO 3/3, PL 9/9 and PF 6/6.
 - `make clean && make memcheck`: 0 errors and 0 bytes in use for all 13 binaries.
 - `pool.c` also compiles `-Werror` clean with `-DNDEBUG`.
+
+---
+
+# Part 4: the split finished, the pooled tree wired and tested
+
+## Stage 1 (committed as 9f1bf76): pool tests split by entry point
+The layout follows the revised table in Part 3. The 9 PL tests were extracted mechanically and moved verbatim; each body appears exactly once across the files, byte for byte.
+- **`test_pool_create.c`:** PL-01, PL-02, PL-09, PL-07, plus three new tests:
+  - **PC-05:** two pools are independent.
+  - **PD-02:** destroying a fresh pool is clean.
+  - **PD-03:** destroying after every object was freed is clean.
+- **`test_pool_alloc.c`:** PL-03, PL-05, PL-06, PL-08, plus four new tests:
+  - **PA-05:** a pop makes no `rb_malloc` and leaves an armed fault pending.
+  - **PA-06:** a freed slot in an older slab is reused before the newest slab's uncarved slots.
+  - **PA-07:** pool fault sweep over a 3-slab script. N = 4 (create + 3 slabs), reproduced.
+  - **PA-08:** boundary triples at 255 slots and 1 slot per slab.
+- **`test_pool.c`:** PL-04, plus two new tests:
+  - **PS-02:** every NULL combination of `pool_stats` outputs.
+  - **PS-03:** the invariant across three pools at once.
+
+All the new tests passed on their first run. None of them found a defect.
+
+## Stage 2: the pooled tree
+### Wiring (`src/rbtree.c`, `src/rbtree_internal.h`)
+- **`struct rbtree`** gains `struct rb_pool *pool`, which is NULL unless the tree came from `rb_create_pooled`.
+- **`rb_create_pooled`** makes two allocations with goto-cleanup: `rb_create`, then `pool_create(sizeof(struct rb_node))`. No slab is allocated until the first insert.
+- **`node_mem_alloc` / `node_mem_free`** dispatch on `t->pool`. `node_release` and `rb_delete` free nodes through them.
+- **`node_alloc`:** unpooled trees keep node-first, unchanged, so RBI-15 and the unpooled sweep labels stay true. Pooled trees allocate the key copy first, then the slot. If the slot fails, `fail_free_key` releases the key copy, and the pool is exactly as it was.
+- **`rb_destroy`** visits every node to release keys and owned values. On pooled trees it skips the per-node free, then calls `pool_destroy`, then frees the tree. No node is touched after `pool_destroy`.
+- **`rb_delete`** frees the node last. A pooled slot is poisoned only once nothing reads it.
+
+### Pooled-tree tests
+- **`test_create.c`:**
+  - **RBC-14:** a pooled tree is empty and valid, its pool reports `(0,0,0)`, creation took 2 allocations, and `rb_create` leaves `pool` NULL.
+  - **RBC-15:** fault sweep over the create. `arm(1)` and `arm(2)` return NULL; `arm(3)` succeeds.
+- **`test_insert.c`:** pooled twins RBI-06P, 07P, 15P, 16P and 17P. Each one also asserts that the pool's stats triple is unchanged. RBI-15P fills slab 1 exactly (85 nodes), then fails the slab after the key copy succeeds. `SNAPSHOT_CAP` went from 8 to 128, so the 85-node snapshot compares every node.
+- **`test_delete.c`:**
+  - **RBD-20:** a pooled delete under `arm(1)` makes 0 allocations, and the triple goes `(1,3,82)` → `(1,2,83)`.
+  - The next new key reuses that exact slot and makes exactly 1 allocation (its key copy).
+- **`test_destroy.c`:** **RBX-07** destroys a fresh pooled tree.
+- **`fault_sweep.c`:** scenarios A and B are swept again on pooled trees.
+  - **Pooled failure rule:** the key copy fails if n == rel+1. The slab fails if n == rel+2, and only when `free_objs == 0` before the insert.
+  - **Checked after every op:** the invariant holds and `live == rb_size`.
+  - **Checked per op type:** failed inserts, overwrites and same-pointer re-inserts leave the triple unchanged, and a delete is exactly `live−1, free+1`.
+  - **N for a clean run:** 2 + 200 + slabs, where the slab count follows the peak live count because deleted slots are reused.
+    - A peaks at 200 live → 3 slabs → **N = 205**.
+    - B peaks at 152 live → 2 slabs → **N = 204**.
+  - The unpooled scenarios and their output text are unchanged.
+- **`fuzz.c`:** a pooled mode, selected by `argv[3] == "pooled"`. After every op it asserts `live + free_objs == slabs * objs_per_slab` and `live == model count`. Both `make test` and `make memcheck` run it.
+
+**Red, then green:**
+- **Red:** before the wiring, all six changed test files failed to build, and only for the predicted reasons: no `pool` member, and no `rb_create_pooled`.
+- **Green:** after the wiring, everything passed on the first run.
+- **Build fix along the way:** the sanitizer build flagged `-Wformat-truncation` on an 8-byte key buffer in the new `pooled_tree_with` test helper. I enlarged it to 16 bytes, in test code only.
+
+## Verification (gcc-14, 2026-10-11)
+- **`make test` and `make asan`** both pass, with 0 sanitizer reports. That covers every suite, plus:
+  - the unpooled sweep at N=401 for A and B (reproduced)
+  - the pooled sweep at N=205 for A and N=204 for B (reproduced)
+  - both 100000-op fuzz runs, default and pooled
+  - GEO 3/3, PL/PS 3/3, PF 6/6, PL/PC/PD 7/7, PL/PA 8/8
+  - create 8/8, insert 22/22, delete 20/20, destroy 3/3
+- **`make clean && make memcheck`:** 0 errors and 0 bytes in use across all 16 valgrind runs: 15 binaries, plus the pooled fuzz run.
+- **Untouched:** `include/rbtree.h` and `src/pool.c`.
+
+---
+
+# Part 5: the full Assignment 1 + Mutation 1 battery on the pooled build
+
+## Why
+After Part 4, only the sweep, the fuzzer and 9 pooled-specific tests ran on pooled trees. Every other battery test still used `rb_create`, so "the battery was rerun on the pooled build" was not yet true.
+
+## Mechanism
+- **`tests/pooled_build.h`** defines `rb_create(vf)` as `rb_create_pooled(vf)` and sets `RB_POOLED_BUILD`.
+  - It is force-included (`-include`) into the **test translation unit only**. Each `build/pooled/<test>` binary compiles its test file alone, then links it with `$(SRC)`, so `src/rbtree.c` never sees the mapping.
+- **The 8 tree test binaries run twice:** unpooled (`build/`) and pooled (`build/pooled/`). Both sets run in `test`, `asan` and `memcheck`.
+- **The sweep and fuzzer** already had pooled modes, so they are not duplicated.
+- **The N/A hook.** The only edit to those 8 test files is a hook in `main`'s run loop, wrapped in `#ifdef RB_POOLED_BUILD`.
+  - No test function, fixture, assertion, table entry or comment changed.
+  - The unpooled preprocessed output of `test_find.c` was compared before and after the hook, and it is identical.
+
+## Step 1: run unchanged, record, diagnose
+**Plain run.** 2 of 82 tests failed: RBC-14 and RBI-15.
+
+**Leak checks** (valgrind on pooled `test_delete`, then asan on every pooled binary) found 4 more tests that pass their assertions but leak:
+- RBD-10 (336 B in 7 blocks)
+- RBF-02 and RBF-03 (96 B)
+- RBS-01 (48 B)
+
+| Test | Cause | Bucket |
+|---|---|---|
+| RBC-14 | It asserts that `rb_create` leaves `pool` NULL, which the mapping makes false by design. | Unpooled-allocator dependent (assertion) |
+| RBI-15 | `arm(2)` needs node-first order. A pooled insert with free slots makes only 1 allocation, so the fault never fires. | Unpooled-allocator dependent (assertion); RBI-15P covers it |
+| RBD-10, RBF-02, RBF-03, RBS-01 | The fixtures link plain-`malloc`'d nodes into the tree. Pooled destroy never frees nodes individually, and `rb_delete` would hand such a node to `pool_free`. | Unpooled-allocator dependent (fixture) |
+| *found via RBD-10:* `POOL_CHECK` | The counts are unsigned, so an over-free wraps `nlive` and still satisfies the conservation sum. | **Real defect, fixed** |
+
+## Fix: `pool_free` asserts `nlive > 0` (debug builds)
+- **Red:** a throwaway program `pool_free`s a foreign pointer into a fresh pool. Before the fix it printed stats `(0, 18446744073709551615, 1)` with no abort.
+- **Green:** after the fix it aborts at `pool.c:153` with "pool_free with no live objects (double or foreign free)". The `NDEBUG` build still compiles clean.
+
+## Declared N/A list (`tests/pooled_build.h`, approved)
+These are unpooled tests whose assertion or fixture depends on how `rb_create` allocates nodes. They don't test pooling. Every entry gives a reason and names what covers the same concern:
+- **RBC-14:** covered by RBC-14 in the unpooled build, which checks both create functions.
+- **RBI-15:** covered by RBI-15P.
+- **RBD-10:** covered by its own unpooled run, because `delete_fixup` is the same code in both builds. No pooled test reaches its two-level case-2 path.
+- **RBF-02, RBF-03:** covered by RBI-13/14, the pooled sweep's `model_matches`, and pooled fuzz finds.
+- **RBS-01:** covered by RBI-17P and the pooled fuzz size check after every op.
+
+How the list is used:
+- **A stale or misspelled entry fails its binary.** Checked with a bogus entry: the binary printed `pooled N/A list names RBF-99, which tests/test_find.c does not define` and exited 1.
+- **The unpooled build** still runs all six tests unchanged.
+- **Pooled `test_size`** therefore runs 0 tests. On the pooled build, `rb_size` is covered only through the tests named in its entry.
+
+## Verification (gcc-14, 2026-10-11)
+- **`make test` and `make asan`** both pass, with 0 sanitizer reports. That covers every unpooled suite, plus:
+  - all 8 pooled binaries: 76 tests run and pass, 6 declared N/A
+  - the unpooled sweep at N=401 for A and B, and the pooled sweep at N=205 for A and N=204 for B, all reproduced
+  - both 100000-op fuzz runs, default and pooled
+- **`make clean && make memcheck`:** 0 errors and 0 bytes in use across all 24 valgrind runs: 23 binaries (15 + 8 pooled), plus the pooled fuzz run.
+- **Untouched:** `include/rbtree.h`.

@@ -5,7 +5,13 @@
 // rb_foreach traversal on a coarser cadence. Allocation-failure injection
 // (rb_fail_next_alloc) is intentionally out of scope for this pass and is
 // left for a later, more extensive iteration of this fuzzer.
+// Pooled mode (M5 Mutation 2): with argv[3] == "pooled" the tree comes from
+// rb_create_pooled, and after EVERY op the pool's own stats must satisfy
+//     live + free_objs == slabs * objs_per_slab   and   live == model count
+// (read through the internal headers). The default mode is unchanged.
 #include "rbtree.h"
+#include "../src/rbtree_internal.h"
+#include "../src/pool.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -173,6 +179,25 @@ static void foreach_check_cb(const char *key, void *value, void *ctx_) {
     ctx->idx++;
 }
 
+/* Pooled mode only: the slot conservation law, and one live slot per node. */
+static bool check_pool(const rbtree_t *t, size_t model_count, unsigned long op_index) {
+    struct pool_geom g;
+    size_t slabs, live, free_objs;
+    if (pool_geometry(sizeof(struct rb_node), &g) != 0) {
+        fprintf(stderr, "fuzz: pool_geometry rejected sizeof(struct rb_node)\n");
+        return false;
+    }
+    pool_stats(t->pool, &slabs, &live, &free_objs);
+    if (live + free_objs != slabs * g.objs_per_slab || live != model_count) {
+        fprintf(stderr,
+                "fuzz: pool stats at op %lu: live=%zu free_objs=%zu slabs=%zu "
+                "(objs_per_slab %zu), model count %zu\n",
+                op_index, live, free_objs, slabs, g.objs_per_slab, model_count);
+        return false;
+    }
+    return true;
+}
+
 static bool run_validate(rbtree_t *t, unsigned long op_index) {
     if (rb_validate(t) != 0) {
         fprintf(stderr, "fuzz: rb_validate failed at op %lu\n", op_index);
@@ -198,9 +223,10 @@ int main(int argc, char **argv) {
         if (end != argv[2] && *end == '\0') seed = (uint64_t)parsed;
     }
     if (seed == 0) seed = 0x9E3779B97F4A7C15ULL;
+    bool pooled = argc > 3 && strcmp(argv[3], "pooled") == 0;
 
-    fprintf(stderr, "fuzz: running %lu operations (seed=%llu)\n",
-            total_ops, (unsigned long long)seed);
+    fprintf(stderr, "fuzz: running %lu operations (seed=%llu%s)\n",
+            total_ops, (unsigned long long)seed, pooled ? ", pooled" : "");
 
     int exit_code = EXIT_SUCCESS;
     bool ok = true;
@@ -210,7 +236,7 @@ int main(int argc, char **argv) {
     model_t model;
     model_init(&model);
 
-    rbtree_t *tree = rb_create(value_free_fn);
+    rbtree_t *tree = pooled ? rb_create_pooled(value_free_fn) : rb_create(value_free_fn);
     if (!tree) {
         fprintf(stderr, "fuzz: rb_create failed\n");
         exit_code = EXIT_FAILURE;
@@ -283,6 +309,10 @@ int main(int argc, char **argv) {
                         op, tree_size, model.count);
                 ok = false;
             }
+        }
+
+        if (ok && pooled) {
+            ok = check_pool(tree, model.count, op);
         }
 
         if (ok && (op % VALIDATE_EVERY) == (VALIDATE_EVERY - 1)) {

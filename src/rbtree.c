@@ -2,6 +2,7 @@
 #include "rbtree.h"
 #include "rbtree_internal.h"
 #include "fault_alloc.h"   /* rb_malloc/rb_free: the only allocation seam */
+#include "pool.h"          /* slab pool behind rb_create_pooled */
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@ rbtree_t *rb_create(rb_value_free_fn value_free) {
     t->root = &t->nil;
     t->size = 0;
     t->value_free = value_free;
+    t->pool = NULL;
 
     /* self-check: a just-built tree must already satisfy RB invariants
      * before it's handed to the caller */
@@ -29,18 +31,47 @@ rbtree_t *rb_create(rb_value_free_fn value_free) {
     return t;
 }
 
+/* Two allocations, tree then pool. The pool holds no slab until the first
+ * insert, so a fresh pooled tree costs exactly these two. */
+rbtree_t *rb_create_pooled(rb_value_free_fn value_free) {
+    struct rbtree *t = rb_create(value_free);
+    if (t == NULL) goto fail;
+    t->pool = pool_create(sizeof(struct rb_node));
+    if (t->pool == NULL) goto fail_free_tree;
+    return t;
+
+fail_free_tree:
+    rb_free(t);
+fail:
+    return NULL;
+}
+
+/* Node storage: the tree's pool if it has one, else the allocation seam. */
+static struct rb_node *node_mem_alloc(struct rbtree *t) {
+    if (t->pool != NULL) return pool_alloc(t->pool);
+    return rb_malloc(sizeof(struct rb_node));
+}
+
+static void node_mem_free(struct rbtree *t, struct rb_node *n) {
+    if (t->pool != NULL) pool_free(t->pool, n);
+    else rb_free(n);
+}
+
+/* Pooled trees skip the per-node free: pool_destroy releases every slab
+ * wholesale afterwards. Keys and owned values are released either way. */
 static void rb_destroy_subtree(struct rbtree *t, struct rb_node *n) {
     if (n == &t->nil) return;          /* base case: sentinel marks "no node" */
     rb_destroy_subtree(t, n->left);
     rb_destroy_subtree(t, n->right);
     if (t->value_free != NULL) t->value_free(n->value);
     rb_free(n->key);
-    rb_free(n);
+    if (t->pool == NULL) rb_free(n);
 }
 
 void rb_destroy(rbtree_t *t) {
     if (t == NULL) return;             /* NULL-safe per header contract */
     rb_destroy_subtree(t, t->root);
+    pool_destroy(t->pool);             /* NULL-safe; no node is touched after this */
     rb_free(t);
 }
 
@@ -130,22 +161,32 @@ static void rotate_right(struct rbtree *t, struct rb_node *x) {
 /* Frees a node allocated by node_alloc that never made it into the tree
  * (its key copy allocation failed). Not for use on a linked-in node --
  * rb_destroy_subtree already owns that path. */
-static void node_release(struct rb_node *z) {
-    rb_free(z);
+static void node_release(struct rbtree *t, struct rb_node *z) {
+    node_mem_free(t, z);
 }
 
 /* Allocates and fully initializes a new RED leaf node (key copied, value
  * stored, left/right pointed at the sentinel, parent set to the given
  * would-be parent). Returns NULL, with everything already cleaned up, on
- * either allocation failure -- the caller does not need to free anything. */
+ * either allocation failure -- the caller does not need to free anything.
+ * Unpooled: node, then key copy. Pooled: key copy, then node, so a failed
+ * insert never leaves the pool holding an extra slab. */
 static struct rb_node *node_alloc(struct rbtree *t, const char *key, void *value,
                                    struct rb_node *parent) {
-    struct rb_node *z = rb_malloc(sizeof *z);
-    if (z == NULL) goto fail;
-
     size_t key_len = strlen(key) + 1;
-    char *key_copy = rb_malloc(key_len);
-    if (key_copy == NULL) goto fail_release_node;
+    struct rb_node *z;
+    char *key_copy;
+    if (t->pool == NULL) {
+        z = node_mem_alloc(t);
+        if (z == NULL) goto fail;
+        key_copy = rb_malloc(key_len);
+        if (key_copy == NULL) goto fail_release_node;
+    } else {
+        key_copy = rb_malloc(key_len);
+        if (key_copy == NULL) goto fail;
+        z = node_mem_alloc(t);
+        if (z == NULL) goto fail_free_key;
+    }
     memcpy(key_copy, key, key_len);
 
     z->key = key_copy;
@@ -156,8 +197,11 @@ static struct rb_node *node_alloc(struct rbtree *t, const char *key, void *value
     z->color = RED;
     return z;
 
+fail_free_key:
+    rb_free(key_copy);
+    goto fail;
 fail_release_node:
-    node_release(z);
+    node_release(t, z);
 fail:
     return NULL;
 }
@@ -393,7 +437,7 @@ int rb_delete(rbtree_t *t, const char *key) {
      * consistent again, so value_free observes a valid tree */
     rb_free(z->key);
     if (t->value_free != NULL) t->value_free(z->value);
-    rb_free(z);
+    node_mem_free(t, z);   /* last: a pooled slot is poisoned once nothing reads z */
     return 0;
 }
 

@@ -412,11 +412,25 @@ static const test_case_t tests[] = {
 int main(void) {
     size_t total = sizeof(tests) / sizeof(tests[0]);
     size_t passed = 0;
+#ifdef RB_POOLED_BUILD
+    size_t na = 0;   /* declared N/A on the pooled build (tests/pooled_build.h) */
+    if (!POOLED_NA_VERIFY(tests, total)) return EXIT_FAILURE;
+#endif
     for (size_t i = 0; i < total; i++) {
+#ifdef RB_POOLED_BUILD
+        if (pooled_na_report(__FILE__, tests[i].id)) {
+            na++;
+            continue;
+        }
+#endif
         bool ok = tests[i].run();
         printf("[%s] %-55s %s\n", tests[i].id, tests[i].name, ok ? "PASS" : "FAIL");
         if (ok) passed++;
     }
+#ifdef RB_POOLED_BUILD
+    total -= na;
+    printf("%zu declared N/A on the pooled build\n", na);
+#endif
     printf("%zu/%zu tests passed\n", passed, total);
     return (passed == total) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
