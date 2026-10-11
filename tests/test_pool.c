@@ -1,8 +1,12 @@
-// Purpose: Unit tests for the slab pool (M5, Mutation 2), built as
-// build/test_pool. The geometry tests (GEO-01..GEO-03) live in
-// tests/test_pool_geom.c.
-// PL-01..PL-09 drive the pool itself; after every step of every scenario,
-// check_stats takes the numbers pool_stats reports and asserts
+// Purpose: The pool_stats oracle and the conservation invariant, end to end
+// (M5, Mutation 2), built as build/test_pool. Per-function tests live in
+// test_pool_geom.c, test_pool_create.c (create + destroy),
+// test_pool_alloc.c and test_pool_free.c.
+//   PL-04 random alloc/free ops keep the invariant  (unchanged)
+//   PS-02 every NULL combination of pool_stats outputs
+//   PS-03 the invariant across one script driving three pools at once
+// After every step of every scenario, check_stats takes the numbers
+// pool_stats reports and asserts
 //     live + free_objs == slabs * objs_per_slab
 // with objs_per_slab taken from pool_geometry, not from pool internals.
 // The pool also asserts the same invariant internally in debug builds
@@ -15,92 +19,12 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 /* the exact expected triples assume 16-byte max alignment, 8-byte pointers */
 static_assert(alignof(max_align_t) == 16 && sizeof(void *) == 8,
-              "PL expected triples are computed for x86-64");
+              "PL/PS expected triples are computed for x86-64");
 
 #define NODE_SIZE ((size_t)48)   /* sizeof(struct rb_node) on this platform */
-
-/* ---- PL-01: a fresh pool holds no slab and costs exactly one rb_malloc ---- */
-static bool test_pl01_create(void) {
-    long a0 = fault_alloc_total();
-    rb_pool_t *p = pool_create(NODE_SIZE);
-    long allocs = fault_alloc_total() - a0;
-    if (!p) {
-        fprintf(stderr, "    pool_create(%zu) returned NULL\n", NODE_SIZE);
-        return false;
-    }
-    bool ok = expect_stats(p, NODE_SIZE, "fresh pool", 0, 0, 0);
-    if (allocs != 1) {
-        fprintf(stderr, "    pool_create made %ld rb_malloc calls, want 1 (lazy first slab)\n",
-                allocs);
-        ok = false;
-    }
-    pool_destroy(p);
-    return ok;
-}
-
-/* ---- PL-02: impossible sizes are rejected without allocating ---- */
-static bool test_pl02_create_rejects(void) {
-    static const size_t bad[] = {0, POOL_SLAB_SIZE - 15, SIZE_MAX};
-    bool ok = true;
-    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
-        long a0 = fault_alloc_total();
-        rb_pool_t *p = pool_create(bad[i]);
-        if (p != NULL || fault_alloc_total() != a0) {
-            fprintf(stderr, "    pool_create(%zu): returned %p after %ld allocations, "
-                    "want NULL after 0\n", bad[i], (void *)p, fault_alloc_total() - a0);
-            pool_destroy(p);
-            ok = false;
-        }
-    }
-    return ok;
-}
-
-/* ---- PL-03: every slot is POOL_ALIGN-aligned and holds obj_size bytes,
- * across several slabs (asan catches a slot that overlaps its neighbour) ---- */
-static bool test_pl03_alignment(void) {
-    static const size_t sizes[] = {1, 8, 24, NODE_SIZE, 100};
-    bool ok = true;
-    for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
-        size_t s = sizes[i];
-        size_t n = 2 * objs_per_slab_for(s) + 3;
-        rb_pool_t *p = pool_create(s);
-        void **objs = malloc(n * sizeof *objs);
-        if (!p || !objs) {
-            fprintf(stderr, "    setup failed for obj_size %zu\n", s);
-            pool_destroy(p);
-            free(objs);
-            return false;
-        }
-        /* invariant: objs[0..k) are live, aligned, and filled with byte k%256 */
-        for (size_t k = 0; k < n && ok; k++) {
-            objs[k] = pool_alloc(p);
-            if (!objs[k] || (uintptr_t)objs[k] % POOL_ALIGN != 0) {
-                fprintf(stderr, "    obj_size %zu, alloc %zu: %p not %zu-aligned\n",
-                        s, k, objs[k], (size_t)POOL_ALIGN);
-                ok = false;
-                break;
-            }
-            memset(objs[k], (int)(k & 0xff), s);
-            ok = check_stats(p, s, "PL-03 alloc", (long)k) && ok;
-        }
-        /* invariant: every slot still holds its own fill byte, so no two overlap */
-        for (size_t k = 0; k < n && ok; k++) {
-            const unsigned char *b = objs[k];
-            if (b[0] != (k & 0xff) || b[s - 1] != (k & 0xff)) {
-                fprintf(stderr, "    obj_size %zu: slot %zu was overwritten by a neighbour\n",
-                        s, k);
-                ok = false;
-            }
-        }
-        pool_destroy(p);
-        free(objs);
-    }
-    return ok;
-}
 
 /* ---- PL-04: 3000 deterministic random alloc/free ops across several
  * slabs; the invariant holds after every op and live matches the model ---- */
@@ -147,116 +71,85 @@ static bool test_pl04_random_ops(void) {
     return ok;
 }
 
-/* ---- PL-05: LIFO reuse -- the slot freed last comes back first, with no
- * rb_malloc ---- */
-static bool test_pl05_lifo_reuse(void) {
-    rb_pool_t *p = pool_create(NODE_SIZE);
-    if (!p) return false;
-    void *a = pool_alloc(p);
-    void *b = pool_alloc(p);
-    bool ok = a && b && check_stats(p, NODE_SIZE, "PL-05 after 2 allocs", 0);
-    pool_free(p, a);
-    ok = check_stats(p, NODE_SIZE, "PL-05 after free", 1) && ok;
-    long a0 = fault_alloc_total();
-    void *c = pool_alloc(p);
-    if (c != a || fault_alloc_total() != a0) {
-        fprintf(stderr, "    realloc returned %p (want freed %p) after %ld rb_malloc calls (want 0)\n",
-                c, a, fault_alloc_total() - a0);
-        ok = false;
-    }
-    ok = expect_stats(p, NODE_SIZE, "PL-05 end", 1, 2, 83) && ok;
-    pool_destroy(p);
-    return ok;
-}
-
-/* ---- PL-06: a failed slab allocation leaves the pool unchanged, and the
- * next pool_alloc succeeds ---- */
-static bool test_pl06_growth_fault(void) {
+/* ---- PS-02: pool_stats fills exactly the outputs it is given, for all
+ * 8 NULL/non-NULL combinations ---- */
+static bool test_ps02_null_outputs(void) {
     rb_pool_t *p = pool_create(NODE_SIZE);
     if (!p) return false;
     size_t per = objs_per_slab_for(NODE_SIZE);
+    void *objs[86] = {0};
     bool ok = true;
-
-    fault_alloc_arm(1);                    /* first slab fails */
-    void *o = pool_alloc(p);
-    fault_alloc_disarm();
-    if (o != NULL) { fprintf(stderr, "    first-slab fault: pool_alloc returned non-NULL\n"); ok = false; }
-    ok = expect_stats(p, NODE_SIZE, "PL-06 after first-slab fault", 0, 0, 0) && ok;
-
-    /* invariant: k objects allocated, all from slab 1 */
-    for (size_t k = 0; k < per && ok; k++) {
-        if (!pool_alloc(p)) { fprintf(stderr, "    alloc %zu failed\n", k); ok = false; }
-    }
-    ok = expect_stats(p, NODE_SIZE, "PL-06 slab 1 full", 1, per, 0) && ok;
-
-    fault_alloc_arm(1);                    /* growth to slab 2 fails */
-    o = pool_alloc(p);
-    fault_alloc_disarm();
-    if (o != NULL) { fprintf(stderr, "    growth fault: pool_alloc returned non-NULL\n"); ok = false; }
-    ok = expect_stats(p, NODE_SIZE, "PL-06 after growth fault", 1, per, 0) && ok;
-
-    o = pool_alloc(p);
-    if (o == NULL) { fprintf(stderr, "    pool_alloc after the fault returned NULL\n"); ok = false; }
-    ok = expect_stats(p, NODE_SIZE, "PL-06 recovered", 2, per + 1, per - 1) && ok;
-    pool_destroy(p);
-    return ok;
-}
-
-/* ---- PL-07: pool_destroy releases every slab even with objects live
- * (leaks are caught by asan/memcheck); pool_destroy(NULL) is a no-op ---- */
-static bool test_pl07_destroy_with_live(void) {
-    rb_pool_t *p = pool_create(NODE_SIZE);
-    if (!p) return false;
-    bool ok = true;
-    void *keep[200];
-    /* invariant: keep[0..k) live; every third one has been freed again */
-    for (long k = 0; k < 200 && ok; k++) {
-        keep[k] = pool_alloc(p);
-        if (!keep[k]) { ok = false; break; }
-        if (k % 3 == 0) pool_free(p, keep[k]);
-        ok = check_stats(p, NODE_SIZE, "PL-07", k) && ok;
-    }
-    pool_destroy(p);
-    pool_destroy(NULL);
-    return ok;
-}
-
-/* ---- PL-08: exact triples at the slab boundaries ---- */
-static bool test_pl08_slab_boundaries(void) {
-    rb_pool_t *p = pool_create(NODE_SIZE);
-    if (!p) return false;
-    size_t per = objs_per_slab_for(NODE_SIZE);   /* 85 */
-    void *objs[86];
-    bool ok = true;
-    /* invariant: objs[0..k) live, k <= per + 1 */
+    /* invariant: objs[0..k) live */
     for (size_t k = 0; k < per + 1 && ok; k++) {
         objs[k] = pool_alloc(p);
         if (!objs[k]) { ok = false; break; }
-        if (k == 0) ok = expect_stats(p, NODE_SIZE, "after alloc 1", 1, 1, per - 1) && ok;
-        if (k == per - 1) ok = expect_stats(p, NODE_SIZE, "after alloc 85", 1, per, 0) && ok;
-        if (k == per) ok = expect_stats(p, NODE_SIZE, "after alloc 86", 2, per + 1, per - 1) && ok;
     }
-    /* invariant: objs[0..k) have been returned to the free list */
-    for (size_t k = 0; k < per + 1 && ok; k++) {
-        pool_free(p, objs[k]);
-        ok = check_stats(p, NODE_SIZE, "PL-08 free", (long)k) && ok;
+    pool_free(p, objs[0]);
+    /* known state: 2 slabs, 85 live, 85 free */
+    ok = ok && expect_stats(p, NODE_SIZE, "PS-02 known state", 2, per, per);
+    const size_t want[3] = {2, per, per};
+    /* invariant: every mask < m filled exactly its non-NULL outputs */
+    for (unsigned m = 0; m < 8 && ok; m++) {
+        size_t got[3] = {SIZE_MAX, SIZE_MAX, SIZE_MAX};
+        pool_stats(p, (m & 1) ? &got[0] : NULL, (m & 2) ? &got[1] : NULL,
+                   (m & 4) ? &got[2] : NULL);
+        /* invariant: outputs < i match want if requested, else stay untouched */
+        for (unsigned i = 0; i < 3; i++) {
+            size_t expect = (m & (1u << i)) ? want[i] : SIZE_MAX;
+            if (got[i] != expect) {
+                fprintf(stderr, "    mask %u output %u: got %zu, want %zu\n", m, i, got[i], expect);
+                ok = false;
+            }
+        }
     }
-    ok = expect_stats(p, NODE_SIZE, "all freed", 2, 0, 2 * per) && ok;
+    ok = check_stats(p, NODE_SIZE, "PS-02 end", 0) && ok;
     pool_destroy(p);
     return ok;
 }
 
-/* ---- PL-09: pool_create's own allocation failing returns NULL ---- */
-static bool test_pl09_create_fault(void) {
-    fault_alloc_arm(1);
-    rb_pool_t *p = pool_create(NODE_SIZE);
-    fault_alloc_disarm();
-    if (p != NULL) {
-        fprintf(stderr, "    pool_create under fault_alloc_arm(1) returned non-NULL\n");
-        pool_destroy(p);
-        return false;
+/* ---- PS-03: one deterministic script drives three pools of different
+ * geometry; the invariant holds on every pool after every op ---- */
+static bool test_ps03_three_pools(void) {
+    enum { NOPS = 3000, CAP = 400, NPOOLS = 3 };
+    static const size_t sizes[NPOOLS] = {1, NODE_SIZE, 100};
+    rb_pool_t *pools[NPOOLS] = {0};
+    static void *live[NPOOLS][CAP];
+    size_t nlive[NPOOLS] = {0};
+    bool ok = true;
+    /* invariant: pools[0..i) were created */
+    for (int i = 0; i < NPOOLS; i++) {
+        pools[i] = pool_create(sizes[i]);
+        if (!pools[i]) ok = false;
     }
-    return true;
+    unsigned seed = 777u;
+    /* invariant: live[i][0..nlive[i]) are exactly pool i's outstanding objects */
+    for (long op = 0; op < NOPS && ok; op++) {
+        seed = seed * 1103515245u + 12345u;
+        int i = (int)((seed >> 16) % NPOOLS);
+        bool do_alloc = nlive[i] == 0 || (nlive[i] < CAP && (seed >> 8) % 3 != 0);
+        if (do_alloc) {
+            void *o = pool_alloc(pools[i]);
+            if (!o) { fprintf(stderr, "    PS-03 op %ld: pool_alloc returned NULL\n", op); ok = false; break; }
+            live[i][nlive[i]++] = o;
+        } else {
+            size_t victim = (seed >> 4) % nlive[i];
+            pool_free(pools[i], live[i][victim]);
+            live[i][victim] = live[i][--nlive[i]];
+        }
+        /* invariant: pools [0..j) satisfy the invariant and match the model */
+        for (int j = 0; j < NPOOLS; j++) {
+            size_t plive;
+            pool_stats(pools[j], NULL, &plive, NULL);
+            if (plive != nlive[j]) {
+                fprintf(stderr, "    PS-03 op %ld pool %d: live=%zu, model %zu\n", op, j, plive, nlive[j]);
+                ok = false;
+            }
+            ok = check_stats(pools[j], sizes[j], "PS-03", op) && ok;
+        }
+    }
+    /* invariant: pools[0..i) destroyed */
+    for (int i = 0; i < NPOOLS; i++) pool_destroy(pools[i]);
+    return ok;
 }
 
 typedef struct {
@@ -266,15 +159,9 @@ typedef struct {
 } test_case_t;
 
 static const test_case_t tests[] = {
-    {"PL-01", "fresh pool: (0,0,0), one rb_malloc", test_pl01_create},
-    {"PL-02", "pool_create rejects impossible sizes", test_pl02_create_rejects},
-    {"PL-03", "slots aligned and non-overlapping", test_pl03_alignment},
     {"PL-04", "random ops keep the invariant", test_pl04_random_ops},
-    {"PL-05", "LIFO reuse without rb_malloc", test_pl05_lifo_reuse},
-    {"PL-06", "slab-growth fault leaves pool unchanged", test_pl06_growth_fault},
-    {"PL-07", "destroy with live objects; destroy(NULL)", test_pl07_destroy_with_live},
-    {"PL-08", "exact stats at slab boundaries", test_pl08_slab_boundaries},
-    {"PL-09", "pool_create allocation failure", test_pl09_create_fault},
+    {"PS-02", "pool_stats with every NULL output combination", test_ps02_null_outputs},
+    {"PS-03", "invariant across three pools at once", test_ps03_three_pools},
 };
 
 int main(void) {
