@@ -2,7 +2,8 @@
 
 > **Status:** plan approved (2026-10-11).
 > - **Increment 1:** done, in commit `cf4cf0e`.
-> - **Increments 2-4:** not started.
+> - **Increment 2:** green under the full battery, awaiting review.
+> - **Increments 3-4:** not started.
 >
 > This file is a copy of the approved plan. Increment 4 turns it into the final record with the test results.
 
@@ -112,7 +113,7 @@ Each increment is **one diff** that is reviewed. Every increment follows the sam
 1. **Write that function's tests.**
 2. **Run them against today's code and show the red output.**
 3. **Write the implementation.**
-4. **Run the full battery and show the output:** `make test`, `make asan`, then `make clean && make memcheck`.
+4. **Run the battery and show the output:** `make test` and `make asan`. `make clean && make memcheck` runs only when requested (from Increment 3 on; Increments 1-2 also ran it).
 5. **Stop for review.** The commit is made only after approval.
 
 A red test can't be committed by itself, because every commit has to be green. So each diff holds the new tests **and** the implementation together. The red output from step 2 is shown during review as evidence. Tests that already pass on today's code (guards) go into the increment for the function they protect.
@@ -122,6 +123,19 @@ A red test can't be committed by itself, because every commit has to be green. S
 - It works in both builds and needs no N/A entry.
 - It never calls `rb_validate`, because the chain is not an RB tree.
 - Each test file is its own binary, so the fixture is a `static` helper in each file that needs it. That copies about 20 lines, to keep the files independent as they are today.
+
+### Static core helpers in src/rbtree.c (added 2026-10-12)
+The spec suggests isolating each loop in a `static` helper with one duty and its invariant comment on top. In Mutation 3 that means:
+- **Teardown core (Increment 2):** `destroy_all_nodes(t)` holds the right-spine loop, with the four-part invariant and Φ_D above it. `rb_destroy` becomes a thin wrapper: NULL check, `destroy_all_nodes`, `pool_destroy`, `rb_free(t)`.
+  - The teardown rotation is written inline and does **not** reuse `rotate_right`. `rotate_right` reads `x->parent` to decide whether to update `t->root`. During teardown, parent links are dead (invariant 1): once the old root is removed, the new root's `parent` still points at the freed node, so `rotate_right` would read and write freed memory.
+- **Traversal core (Increment 3):**
+  - `inorder_first(t)` holds the descend loop (measure: subtree height).
+  - `inorder_next(t, n)` holds the descend-or-climb step (measure: depth). It is const, unlike `tree_minimum`, which stays as it is for `rb_delete`.
+  - `rb_foreach` becomes one `for` loop over them, carrying Φ_F, the `fn` call and the debug size assert.
+- **What is not shared:**
+  - **Node release.** `rb_delete` frees key then value, while teardown frees value then key and skips the per-node free when pooled. Merging them would change behavior.
+  - **`src/pool.c`.** It already follows this style (`freelist_push`/`freelist_pop`) and is not touched.
+- **Testing:** all helpers are `static` and are tested only through `rb_destroy` and `rb_foreach`. The planned tests are unchanged.
 
 ### Increment 1: guard the parent links (test only, M3 prep). Done in `cf4cf0e`
 - **Why first:** the foreach walk depends on correct parent links, and `rb_validate` does not check them. This pins the precondition before anything relies on it.
@@ -144,7 +158,7 @@ Tests:
   - **RBX-11:** `rb_destroy` makes zero `rb_malloc` calls.
 
 Implementation in [src/rbtree.c](src/rbtree.c):
-- Delete `rb_destroy_subtree`. `rb_destroy` runs the right-spine loop on `t->root`, with the invariant comment.
+- Replace `rb_destroy_subtree` with the teardown core `destroy_all_nodes`, which runs the right-spine loop on `t->root` under its invariant comment. `rb_destroy` wraps it.
 - Per-node release stays as it is: `value_free`, `rb_free(key)`, then `if (t->pool == NULL) rb_free(n)`. Move `t->root` past the node before releasing it.
 - Then call `pool_destroy` and `rb_free(t)`.
 - Fix the `node_release` comment that mentions `rb_destroy_subtree`.
@@ -159,7 +173,7 @@ Tests:
   - **RBW-14:** a nested foreach gives N×N calls in order.
 
 Implementation in [src/rbtree.c](src/rbtree.c):
-- Delete `rb_foreach_node`. `rb_foreach` becomes the parent walk: `const` pointers, inline descend and climb loops with one-line invariants, the contract comment, and the `#ifndef NDEBUG` size assert (adds `<assert.h>`).
+- Replace `rb_foreach_node` with the traversal core, `inorder_first` and `inorder_next`, each with its loop invariant and measure. `rb_foreach` is one `for` loop over them, with the contract comment and the `#ifndef NDEBUG` size assert (adds `<assert.h>`).
 
 ### Increment 4: finalize this file
 - Turn this plan into the record of what was done: mark each increment done with its commit, note anything that changed from the plan, and add the final battery output.
@@ -174,5 +188,5 @@ Implementation in [src/rbtree.c](src/rbtree.c):
 
 ## Verification (per increment)
 - **Red:** the new tests run against the old code, with output shown. Increment 1 has no red step, because it is a guard.
-- **Green:** `make test`, `make asan`, then `make clean && make memcheck`, with the output of all three shown. Valgrind on ≥10⁶-node trees is slow. That is expected.
+- **Green:** `make test` and `make asan`, with the output shown. `make clean && make memcheck` runs only when requested, because valgrind on ≥10⁶-node trees is slow.
 - Then the diff is reviewed and committed.

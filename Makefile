@@ -22,6 +22,8 @@ INBIN := build/test_insert
 SIBIN := build/test_size
 FUZZBIN := build/fuzz
 SWEEPBIN := build/fault_sweep
+# Mutation 3: 64 KB-stack teardown/traversal proof (pthreads)
+STBIN := build/test_stress
 PRODOBJ := build/rbtree_prod.o
 # pool: tested on its own until the tree is wired to it
 POOLSRC := src/pool.c tests/fault_alloc.c tests/test_pool_geom.c
@@ -39,7 +41,7 @@ POOLPRODOBJ := build/pool_prod.o
 # rb_create mapped to rb_create_pooled in the test TU only
 POOLED_TESTS := test_rbtree test_delete test_create test_destroy test_find test_foreach test_insert test_size
 POOLEDBINS := $(addprefix build/pooled/,$(POOLED_TESTS))
-all: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PCBIN) $(PABIN) $(POOLEDBINS) $(PRODOBJ) $(POOLPRODOBJ)
+all: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(STBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PCBIN) $(PABIN) $(POOLEDBINS) $(PRODOBJ) $(POOLPRODOBJ)
 # compile-only: keeps the production (malloc-forwarding) seam -Werror clean
 $(PRODOBJ): src/rbtree.c include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
@@ -97,8 +99,11 @@ $(FUZZBIN): $(SRC) tests/fuzz.c include/rbtree.h src/rbtree_internal.h src/pool.
 $(SWEEPBIN): $(SRC) tests/fault_sweep.c include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) tests/fault_sweep.c -o $@
-test: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PCBIN) $(PABIN) $(POOLEDBINS)
-	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(FUZZBIN) 100000 12648430 pooled && ./$(SWEEPBIN) && ./$(POOLBIN) && ./$(PLBIN) && ./$(PFBIN) && ./$(PCBIN) && ./$(PABIN)
+$(STBIN): $(SRC) tests/test_stress.c include/rbtree.h src/rbtree_internal.h src/pool.h tests/fault_alloc.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -pthread $(SRC) tests/test_stress.c -o $@
+test: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(STBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PCBIN) $(PABIN) $(POOLEDBINS)
+	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(FUZZBIN) 100000 12648430 pooled && ./$(SWEEPBIN) && ./$(STBIN) && ./$(POOLBIN) && ./$(PLBIN) && ./$(PFBIN) && ./$(PCBIN) && ./$(PABIN)
 	@for b in $(POOLEDBINS); do echo "== pooled build: $$b"; ./$$b || exit 1; done
 asan: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: clean test
@@ -125,6 +130,8 @@ memcheck: all
 	--error-exitcode=1 ./$(FUZZBIN) 100000 12648430 pooled
 	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(SWEEPBIN)
+	valgrind --leak-check=full --show-leak-kinds=all \
+	--error-exitcode=1 ./$(STBIN)
 	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(POOLBIN)
 	valgrind --leak-check=full --show-leak-kinds=all \

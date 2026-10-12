@@ -57,20 +57,40 @@ static void node_mem_free(struct rbtree *t, struct rb_node *n) {
     else rb_free(n);
 }
 
-/* Pooled trees skip the per-node free: pool_destroy releases every slab
- * wholesale afterwards. Keys and owned values are released either way. */
-static void rb_destroy_subtree(struct rbtree *t, struct rb_node *n) {
-    if (n == &t->nil) return;          /* base case: sentinel marks "no node" */
-    rb_destroy_subtree(t, n->left);
-    rb_destroy_subtree(t, n->right);
-    if (t->value_free != NULL) t->value_free(n->value);
-    rb_free(n->key);
-    if (t->pool == NULL) rb_free(n);
+/* Teardown core (Mutation 3): releases every node, key copy and owned value
+ * in O(1) auxiliary space, with no recursion and no explicit stack. The
+ * to-do list is the live part's own child links; t->root is the cursor.
+ * Pooled trees skip the per-node free: pool_destroy releases every slab
+ * wholesale afterwards. Keys and owned values are released either way.
+ * The rotation is inline, not rotate_right: parent links are dead here
+ * (a freed node may still be named as a parent), and rotate_right reads them.
+ * Terminates: Phi = live + live-off-the-right-spine >= 0 drops by exactly 1
+ * per pass (a rotation moves one node onto the spine, a removal frees one
+ * spine node), and no pass ever moves a node off the spine. */
+static void destroy_all_nodes(struct rbtree *t) {
+    /* invariant: freed nodes are unreachable; rotations free nothing;
+     * t->root is the root of the still-live part, which is a tree */
+    while (t->root != &t->nil) {
+        struct rb_node *r = t->root;
+        if (r->left != &t->nil) {
+            /* restructure: rotate right, so the left child joins the spine */
+            struct rb_node *l = r->left;
+            r->left = l->right;
+            l->right = r;
+            t->root = l;
+        } else {
+            /* r is the leftmost live node: advance past it, then release it */
+            t->root = r->right;
+            if (t->value_free != NULL) t->value_free(r->value);
+            rb_free(r->key);
+            if (t->pool == NULL) rb_free(r);
+        }
+    }
 }
 
 void rb_destroy(rbtree_t *t) {
     if (t == NULL) return;             /* NULL-safe per header contract */
-    rb_destroy_subtree(t, t->root);
+    destroy_all_nodes(t);
     pool_destroy(t->pool);             /* NULL-safe; no node is touched after this */
     rb_free(t);
 }
@@ -160,7 +180,7 @@ static void rotate_right(struct rbtree *t, struct rb_node *x) {
 
 /* Frees a node allocated by node_alloc that never made it into the tree
  * (its key copy allocation failed). Not for use on a linked-in node --
- * rb_destroy_subtree already owns that path. */
+ * destroy_all_nodes already owns that path. */
 static void node_release(struct rbtree *t, struct rb_node *z) {
     node_mem_free(t, z);
 }
