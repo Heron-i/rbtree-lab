@@ -1,15 +1,15 @@
 # Mutation 3 ("No stack to spare"): O(1)-space teardown and traversal
 
-> **Status:** code complete. Gap closure is in progress (Increments 5-7). The plan was approved on 2026-10-11 and the code was written in three increments, one function per cycle:
+> **Status:** complete. The plan was approved on 2026-10-11 and the code was written in three increments, one function per cycle:
 > - **Increment 1:** the parent-link guard, commit `cf4cf0e`.
 > - **Increment 2:** `rb_destroy`, commit `fe457f7`.
 > - **Increment 3:** `rb_foreach`, commit `339b296`.
 > - **Increment 4:** this file finalized as the record, plus the final battery (docs only).
 >
-> A check against the spec on 2026-10-12 found three gaps, which are being closed as small diffs:
+> A check against the spec on 2026-10-12 found three gaps, each closed by a small diff:
 > - **Increment 5:** the big stress case behind `--big`, commit `8bc01dc`.
-> - **Increment 6:** the `const` wording in the `rb_foreach` contract. Green, awaiting review.
-> - **Increment 7:** final status update. Not started.
+> - **Increment 6:** the `const` wording in the `rb_foreach` contract, commit `1bb6e89`.
+> - **Increment 7:** this final status update (docs only).
 > - The spec's "account for the cost in your reflection" item is covered in `REFLECTION.md`, which you write, so it isn't an increment here.
 >
 > Anything that changed from the plan is noted where it happened. The final battery is under "Final verification".
@@ -18,7 +18,7 @@
 The comments in `include/rbtree.h` require `rb_foreach` and `rb_destroy` to use **O(1) auxiliary space with no recursion**.
 - **Before Mutation 3,** both were recursive: `rb_destroy_subtree` recursed into both children, and `rb_foreach_node` did a recursive in-order walk. `rb_delete` was already iterative and was not touched.
 - **`rb_destroy`** now uses right-spine rotation: the teardown core `destroy_all_nodes`, [src/rbtree.c:71-97](src/rbtree.c#L71-L97).
-- **`rb_foreach`** now uses the explicit parent-pointer walk: the traversal core `inorder_first`/`inorder_next`, [src/rbtree.c:468-520](src/rbtree.c#L468-L520). It is read-only. Its memory cost is shown through `pool_stats` by a test (RBW-12) and documentation only, so **`src/pool.c` was not changed**.
+- **`rb_foreach`** now uses the explicit parent-pointer walk: the traversal core `inorder_first`/`inorder_next`, [src/rbtree.c:468-525](src/rbtree.c#L468-L525). It is read-only. Its memory cost is shown through `pool_stats` by a test (RBW-12) and documentation only, so **`src/pool.c` was not changed**.
 - **Misuse:** a callback that mutates the tree, or a NULL `fn`, is documented as UB. A debug-build `assert` checks that `t->size` is unchanged after each callback.
 
 ### Hard constraint: no explicit stack
@@ -241,15 +241,17 @@ Each is closed by one small reviewed diff, using the same cycle as above.
   - `make asan`: exit 0, the same 204 PASS, 0 FAIL, and no sanitizer reports, also at N = 1048576.
   - `make clean && make memcheck`: exit 0. All 25 valgrind runs report 0 errors with all heap blocks freed, and `test_stress` ran at N = 16384. The total time was **53 s**, down from 1 min 20 s.
 
-### Increment 6: `const` wording in the `rb_foreach` contract. Green, awaiting review
+### Increment 6: `const` wording in the `rb_foreach` contract. Commit `1bb6e89`
 - [src/rbtree.c](src/rbtree.c): the contract comment above `rb_foreach` gains a `const` bullet. It says that the frozen header passes `t` as `const rbtree_t *`, and that the walk keeps that promise because it only reads child and parent links. Morris traversal would have to cast `const` away to rewire `right` links in place, and a callback that never returns would leave those rewired links, as cycles, behind.
 - **Scope:** a comment only, so no behavior changes and no new tests. There is no red step, because nothing here can fail a test.
 - **Battery:** `make test` and `make asan` both exited 0, with 204 PASS, 0 FAIL, no sanitizer reports and no compiler warnings. Memcheck was not run, because nothing it checks changed.
 
-### Increment 7: final status update. Not started
-- **Plan:** once Increments 5 and 6 are committed, mark them done with their commits in the status block and here.
-- Update "Final verification" for the `--big` split.
-- Set the status to complete.
+### Increment 7: final status update (docs only)
+- Increments 5 and 6 are marked done with their commits, in the status block and in their sections.
+- The status is set to complete.
+- The `rb_foreach` line link in Context is updated for the longer contract comment (now 468-525).
+- "Final verification" now describes the code as committed (`1bb6e89`) and the `--big` split.
+- **No code changed.** `make test` was re-run to confirm.
 
 **Across all increments:**
 - No explicit stack and no allocation in either function.
@@ -259,10 +261,13 @@ Each is closed by one small reviewed diff, using the same cycle as above.
 ---
 
 ## Final verification
-Run 2026-10-12 on the code at commit `339b296`. Increment 4 changes only this file.
+The code as committed at `1bb6e89`. Since `8bc01dc`, the only code change is Increment 6's comment, so memcheck was not re-run after it. All runs are from 2026-10-12.
 
-| Command | Exit | Result |
-|---|---|---|
-| `make test` | 0 | 204 test lines PASS, 0 FAIL, across the unpooled and pooled batteries. Both fuzz modes pass 100,000 ops (the parent-link check runs every 100 ops). All 4 fault sweeps fail at every predicted site and leave the tree unchanged. RBM-01..03 pass on the 64 KB stack. |
-| `make asan` | 0 | The same 204 PASS, 0 FAIL, with no AddressSanitizer or UBSan reports. The 64 KB thread is enough under ASan too. |
-| `make clean && make memcheck` | 0 | All 25 valgrind runs report `ERROR SUMMARY: 0 errors`, and all 25 report "All heap blocks were freed -- no leaks are possible". That includes `test_stress` (3 × 2²⁰ nodes walked and destroyed). The run took 1 min 20 s. |
+| Command | Run on | Exit | Result |
+|---|---|---|---|
+| `make test` | `1bb6e89` | 0 | 204 test lines PASS, 0 FAIL, across the unpooled and pooled batteries. Both fuzz modes pass 100,000 ops (the parent-link check runs every 100 ops). All 4 fault sweeps fail at every predicted site and leave the tree unchanged. `test_stress --big` passes RBM-01..03 at N = 2²⁰ on the 64 KB stack. |
+| `make asan` | `1bb6e89` | 0 | The same 204 PASS, 0 FAIL, with no AddressSanitizer or UBSan reports and no compiler warnings. The 64 KB thread is enough under ASan too. |
+| `make clean && make memcheck` | `8bc01dc` | 0 | All 25 valgrind runs report `ERROR SUMMARY: 0 errors`, and all 25 report "All heap blocks were freed -- no leaks are possible". `test_stress` runs at its default N = 2¹⁴. The total time was 53 s. |
+
+- **Earlier full run:** before the `--big` split, memcheck ran `test_stress` at N = 2²⁰ on `339b296`. It was also 25/25 clean, and took 1 min 20 s.
+- **Re-running the big case under valgrind:** `make clean && make memcheck STRESS_FLAGS=--big`.
