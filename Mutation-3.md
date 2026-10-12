@@ -1,10 +1,16 @@
 # Mutation 3 ("No stack to spare"): O(1)-space teardown and traversal
 
-> **Status:** complete. The plan was approved on 2026-10-11 and carried out in three increments, one function per cycle:
+> **Status:** code complete. Gap closure is in progress (Increments 5-7). The plan was approved on 2026-10-11 and the code was written in three increments, one function per cycle:
 > - **Increment 1:** the parent-link guard, commit `cf4cf0e`.
 > - **Increment 2:** `rb_destroy`, commit `fe457f7`.
 > - **Increment 3:** `rb_foreach`, commit `339b296`.
 > - **Increment 4:** this file finalized as the record, plus the final battery (docs only).
+>
+> A check against the spec on 2026-10-12 found three gaps, which are being closed as small diffs:
+> - **Increment 5:** the big stress case behind `--big`. Green, awaiting review.
+> - **Increment 6:** the `const` wording in the `rb_foreach` contract. Not started.
+> - **Increment 7:** final status update. Not started.
+> - The spec's "account for the cost in your reflection" item is covered in `REFLECTION.md`, which you write, so it isn't an increment here.
 >
 > Anything that changed from the plan is noted where it happened. The final battery is under "Final verification".
 
@@ -205,6 +211,44 @@ Implementation in [src/rbtree.c](src/rbtree.c):
   - the shared fixture header that was considered and not adopted
 - **One theory correction:** `rb_foreach`'s per-call state includes `inorder_next`'s locals, one call deep. It is still a fixed size.
 - **No code changed.** The full battery (`make test`, `make asan`, `make clean && make memcheck`) was run on the code at `339b296`. The results are below.
+
+### Gap closure (added 2026-10-12)
+Checking the finished work against the spec's wording found three items that were only partly met:
+1. **The big case was not behind a flag.** `test_stress` always ran 2²⁰ nodes, including under valgrind.
+2. **The `rb_foreach` contract comment in the code didn't name the `const` wrinkle.** It was covered only in this file.
+3. **This file's status said "complete".**
+
+Each is closed by one small reviewed diff, using the same cycle as above.
+
+### Increment 5: big stress case behind `--big`. Green, awaiting review
+- **You decided:**
+  - `test_stress` runs N = 2¹⁴ = 16,384 by default, and `--big` runs the 2²⁰ (≥10⁶) case.
+  - `make test` and `make asan` always pass `--big`.
+  - `make memcheck` runs the small default, and `make memcheck STRESS_FLAGS=--big` opts the big case in.
+- **Why 2¹⁴ still proves the bound:** the recursive code overflowed the 64 KB stack after about 1,270 frames (foreach) and 1,910 frames (destroy). A 16,384-deep chain is 8-13× past that.
+- [tests/test_stress.c](tests/test_stress.c):
+  - The `STRESS_N` macro became `SMALL_N`/`BIG_N` plus a runtime `stress_n`. Both are powers of two, so RBM-01's index mask still permutes [0, N).
+  - `main` accepts no argument or `--big`. Anything else prints usage and exits nonzero, so a typo can't silently run the small case.
+  - It prints the N in use before the cases.
+- [Makefile](Makefile): adds `STRESS_FLAGS ?=`. The `test` recipe passes `--big`, and `memcheck` passes `$(STRESS_FLAGS)`.
+- **Shown to still go red:** the new `test_stress.c`, built in the scratchpad against the pre-Mutation-3 `src/rbtree.c` (`63a9bb9`), crashed with SIGSEGV in RBM-02 at **both** sizes, while RBM-01 passed.
+- **Flags:**
+  - With no argument it reports N = 16384 and runs in 0.03 s.
+  - With `--big` it reports N = 1048576 and runs in 1.3 s.
+  - With `--bogus` or `--big extra` it prints usage and exits 1.
+- **Battery:**
+  - `make test`: exit 0, 204 PASS, 0 FAIL, with `test_stress` at N = 1048576.
+  - `make asan`: exit 0, the same 204 PASS, 0 FAIL, and no sanitizer reports, also at N = 1048576.
+  - `make clean && make memcheck`: exit 0. All 25 valgrind runs report 0 errors with all heap blocks freed, and `test_stress` ran at N = 16384. The total time was **53 s**, down from 1 min 20 s.
+
+### Increment 6: `const` wording in the `rb_foreach` contract. Not started
+- **Plan:** add one sentence to the contract comment above `rb_foreach` in [src/rbtree.c](src/rbtree.c). It will say that the walk honors the header's `const rbtree_t *` because it only reads links, and that Morris traversal would have to cast `const` away to rewrite `right` links.
+- **Scope:** a comment only, so no behavior changes and no new tests. `make test` and `make asan` confirm the build stays clean.
+
+### Increment 7: final status update. Not started
+- **Plan:** once Increments 5 and 6 are committed, mark them done with their commits in the status block and here.
+- Update "Final verification" for the `--big` split.
+- Set the status to complete.
 
 **Across all increments:**
 - No explicit stack and no allocation in either function.

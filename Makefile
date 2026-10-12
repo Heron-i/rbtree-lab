@@ -24,6 +24,9 @@ FUZZBIN := build/fuzz
 SWEEPBIN := build/fault_sweep
 # Mutation 3: 64 KB-stack teardown/traversal proof (pthreads)
 STBIN := build/test_stress
+# test_stress runs N = 2^14 by default; --big runs the 2^20 (>= 10^6) case.
+# make test/asan always pass --big; make memcheck STRESS_FLAGS=--big opts in.
+STRESS_FLAGS ?=
 PRODOBJ := build/rbtree_prod.o
 # pool: tested on its own until the tree is wired to it
 POOLSRC := src/pool.c tests/fault_alloc.c tests/test_pool_geom.c
@@ -103,7 +106,7 @@ $(STBIN): $(SRC) tests/test_stress.c include/rbtree.h src/rbtree_internal.h src/
 	@mkdir -p build
 	$(CC) $(CFLAGS) -pthread $(SRC) tests/test_stress.c -o $@
 test: $(BIN) $(DBIN) $(CRBIN) $(DEBIN) $(FIBIN) $(FEBIN) $(INBIN) $(SIBIN) $(FUZZBIN) $(SWEEPBIN) $(STBIN) $(POOLBIN) $(PLBIN) $(PFBIN) $(PCBIN) $(PABIN) $(POOLEDBINS)
-	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(FUZZBIN) 100000 12648430 pooled && ./$(SWEEPBIN) && ./$(STBIN) && ./$(POOLBIN) && ./$(PLBIN) && ./$(PFBIN) && ./$(PCBIN) && ./$(PABIN)
+	./$(BIN) && ./$(DBIN) && ./$(CRBIN) && ./$(DEBIN) && ./$(FIBIN) && ./$(FEBIN) && ./$(INBIN) && ./$(SIBIN) && ./$(FUZZBIN) 100000 && ./$(FUZZBIN) 100000 12648430 pooled && ./$(SWEEPBIN) && ./$(STBIN) --big && ./$(POOLBIN) && ./$(PLBIN) && ./$(PFBIN) && ./$(PCBIN) && ./$(PABIN)
 	@for b in $(POOLEDBINS); do echo "== pooled build: $$b"; ./$$b || exit 1; done
 asan: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: clean test
@@ -131,7 +134,7 @@ memcheck: all
 	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(SWEEPBIN)
 	valgrind --leak-check=full --show-leak-kinds=all \
-	--error-exitcode=1 ./$(STBIN)
+	--error-exitcode=1 ./$(STBIN) $(STRESS_FLAGS)
 	valgrind --leak-check=full --show-leak-kinds=all \
 	--error-exitcode=1 ./$(POOLBIN)
 	valgrind --leak-check=full --show-leak-kinds=all \

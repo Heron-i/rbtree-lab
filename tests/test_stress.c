@@ -1,10 +1,14 @@
 // Purpose: Mutation 3 stack-bound proof. rb_foreach and then rb_destroy run
-// on a thread whose whole stack is 64 KB, over trees of 2^20 (>= 10^6)
-// nodes. Any recursion (or explicit stack) proportional to tree height
-// overflows there on the hand-built chains, whose height is N; the
-// iterative walk and teardown need only constant-size frames. All trees
-// are pooled, which keeps building 10^6 nodes fast (one rb_malloc per 85
-// nodes instead of one per node).
+// on a thread whose whole stack is 64 KB, over trees of N nodes. Any
+// recursion (or explicit stack) proportional to tree height overflows
+// there on the hand-built chains, whose height is N; the iterative walk
+// and teardown need only constant-size frames. All trees are pooled, which
+// keeps building them fast (one rb_malloc per 85 nodes instead of one per
+// node).
+// Size: N = 2^14 by default, so make memcheck stays quick; --big runs the
+// 2^20 (>= 10^6) case, which make test and make asan always pass. 2^14
+// still proves the bound: the recursive code overflowed this stack after
+// about 1,270 (foreach) and 1,910 (destroy) frames.
 //   RBM-01: a real red-black tree built with rb_insert (stress test; its
 //           height is about 40, so it fits either way)
 //   RBM-02: a left chain (walk descends N deep; N - 1 teardown rotations)
@@ -22,8 +26,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define STRESS_N (1u << 20)          /* 1,048,576 >= 10^6 */
+#define SMALL_N (1u << 14)           /* default: 16,384, quick under valgrind */
+#define BIG_N (1u << 20)             /* --big: 1,048,576 >= 10^6 */
 #define SMALL_STACK ((size_t)64 * 1024)
+
+/* nodes per case; a power of two, so RBM-01's index mask permutes [0, n) */
+static unsigned stress_n = SMALL_N;
 
 /* ---- Hand-built shapes (Mutation 3) ----
  * Far deeper than any red-black tree: a chain of n nodes has height n.
@@ -174,7 +182,7 @@ static bool destroy_small_and_check(rbtree_t *t, unsigned char *marks) {
     return ok;
 }
 
-/* ---- RBM-01: 2^20-node red-black tree from rb_insert ---- */
+/* ---- RBM-01: N-node red-black tree from rb_insert ---- */
 static bool test_rbm01_rbtree_destroy_small_stack(void) {
     unsigned char *marks = calloc(stress_n, 1);
     rbtree_t *t = rb_create_pooled(mark_freed);
@@ -186,7 +194,8 @@ static bool test_rbm01_rbtree_destroy_small_stack(void) {
     }
     char key[FIXTURE_KEY_LEN];
     /* invariant: the keys of the first i scrambled indices are in t. An odd
-     * multiplier permutes [0, 2^20), so every index is inserted exactly once. */
+     * multiplier permutes [0, N) for N a power of two, so every index is
+     * inserted exactly once. */
     for (unsigned i = 0; i < stress_n; i++) {
         unsigned idx = (i * 2654435761u) & (stress_n - 1);
         snprintf(key, sizeof key, "k%07u", idx);
@@ -206,7 +215,7 @@ static bool test_rbm01_rbtree_destroy_small_stack(void) {
     return destroy_small_and_check(t, marks);
 }
 
-/* Builds a 2^20-node pooled chain and destroys it on the 64 KB thread. */
+/* Builds an N-node pooled chain and destroys it on the 64 KB thread. */
 static bool chain_destroy_small_stack(enum fixture_shape shape) {
     unsigned char *marks = calloc(stress_n, 1);
     rbtree_t *t = rb_create_pooled(mark_freed);
@@ -225,12 +234,12 @@ static bool chain_destroy_small_stack(enum fixture_shape shape) {
     return destroy_small_and_check(t, marks);
 }
 
-/* ---- RBM-02: 2^20-node left chain ---- */
+/* ---- RBM-02: N-node left chain ---- */
 static bool test_rbm02_left_chain_destroy_small_stack(void) {
     return chain_destroy_small_stack(FIXTURE_LEFT_CHAIN);
 }
 
-/* ---- RBM-03: 2^20-node right chain ---- */
+/* ---- RBM-03: N-node right chain ---- */
 static bool test_rbm03_right_chain_destroy_small_stack(void) {
     return chain_destroy_small_stack(FIXTURE_RIGHT_CHAIN);
 }
@@ -242,12 +251,20 @@ typedef struct {
 } test_case_t;
 
 static const test_case_t tests[] = {
-    {"RBM-01", "2^20-node RB tree walked + destroyed on a 64 KB stack", test_rbm01_rbtree_destroy_small_stack},
-    {"RBM-02", "2^20-node left chain walked + destroyed on a 64 KB stack", test_rbm02_left_chain_destroy_small_stack},
-    {"RBM-03", "2^20-node right chain walked + destroyed on a 64 KB stack", test_rbm03_right_chain_destroy_small_stack},
+    {"RBM-01", "RB tree walked + destroyed on a 64 KB stack", test_rbm01_rbtree_destroy_small_stack},
+    {"RBM-02", "left chain walked + destroyed on a 64 KB stack", test_rbm02_left_chain_destroy_small_stack},
+    {"RBM-03", "right chain walked + destroyed on a 64 KB stack", test_rbm03_right_chain_destroy_small_stack},
 };
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--big") == 0) {
+        stress_n = BIG_N;
+    } else if (argc != 1) {
+        /* a typo must not silently fall back to the small case */
+        fprintf(stderr, "usage: %s [--big]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    printf("test_stress: N = %u per case (2^14 default | 2^20 with --big)\n", stress_n);
     size_t total = sizeof(tests) / sizeof(tests[0]);
     size_t passed = 0;
     for (size_t i = 0; i < total; i++) {
