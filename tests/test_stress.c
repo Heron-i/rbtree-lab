@@ -119,7 +119,7 @@ static void walk_check_cb(const char *key, void *value, void *ctx) {
     char want[FIXTURE_KEY_LEN];
     if (!w->ok) return;
     snprintf(want, sizeof want, "k%07u", w->next);
-    if (w->next >= STRESS_N || strcmp(key, want) != 0 || value != &w->marks[w->next]) {
+    if (w->next >= stress_n || strcmp(key, want) != 0 || value != &w->marks[w->next]) {
         fprintf(stderr, "    walk position %u: got key \"%s\" (want \"%s\" with its own value)\n",
                 w->next, key, want);
         w->ok = false;
@@ -158,25 +158,25 @@ static bool run_on_small_stack(void *(*body)(void *), void *arg) {
     return true;
 }
 
-/* On the 64 KB thread, walks t (all STRESS_N keys in order) and then
+/* On the 64 KB thread, walks t (all stress_n keys in order) and then
  * destroys it; afterwards checks each value was freed once. Owns t and
  * marks either way. */
 static bool destroy_small_and_check(rbtree_t *t, unsigned char *marks) {
     struct stress_job job = {.t = t, .walk = {.marks = marks, .next = 0, .ok = true}};
     bool ok = run_on_small_stack(walk_then_destroy_body, &job);
     if (!ok) rb_destroy(t);   /* thread never ran: release on this stack */
-    if (ok && job.walk.ok && job.walk.next != STRESS_N) {
-        fprintf(stderr, "    walk visited %u keys (want %u)\n", job.walk.next, STRESS_N);
+    if (ok && job.walk.ok && job.walk.next != stress_n) {
+        fprintf(stderr, "    walk visited %u keys (want %u)\n", job.walk.next, stress_n);
         job.walk.ok = false;
     }
-    ok = ok && job.walk.ok && all_marked_once(marks, STRESS_N);
+    ok = ok && job.walk.ok && all_marked_once(marks, stress_n);
     free(marks);
     return ok;
 }
 
 /* ---- RBM-01: 2^20-node red-black tree from rb_insert ---- */
 static bool test_rbm01_rbtree_destroy_small_stack(void) {
-    unsigned char *marks = calloc(STRESS_N, 1);
+    unsigned char *marks = calloc(stress_n, 1);
     rbtree_t *t = rb_create_pooled(mark_freed);
     if (!marks || !t) {
         fprintf(stderr, "    setup allocation failed\n");
@@ -187,8 +187,8 @@ static bool test_rbm01_rbtree_destroy_small_stack(void) {
     char key[FIXTURE_KEY_LEN];
     /* invariant: the keys of the first i scrambled indices are in t. An odd
      * multiplier permutes [0, 2^20), so every index is inserted exactly once. */
-    for (unsigned i = 0; i < STRESS_N; i++) {
-        unsigned idx = (i * 2654435761u) & (STRESS_N - 1);
+    for (unsigned i = 0; i < stress_n; i++) {
+        unsigned idx = (i * 2654435761u) & (stress_n - 1);
         snprintf(key, sizeof key, "k%07u", idx);
         if (rb_insert(t, key, &marks[idx]) != 0) {
             fprintf(stderr, "    rb_insert failed at i=%u\n", i);
@@ -197,8 +197,8 @@ static bool test_rbm01_rbtree_destroy_small_stack(void) {
             return false;
         }
     }
-    if (rb_size(t) != STRESS_N) {
-        fprintf(stderr, "    rb_size=%zu after inserts (want %u)\n", rb_size(t), STRESS_N);
+    if (rb_size(t) != stress_n) {
+        fprintf(stderr, "    rb_size=%zu after inserts (want %u)\n", rb_size(t), stress_n);
         rb_destroy(t);
         free(marks);
         return false;
@@ -208,7 +208,7 @@ static bool test_rbm01_rbtree_destroy_small_stack(void) {
 
 /* Builds a 2^20-node pooled chain and destroys it on the 64 KB thread. */
 static bool chain_destroy_small_stack(enum fixture_shape shape) {
-    unsigned char *marks = calloc(STRESS_N, 1);
+    unsigned char *marks = calloc(stress_n, 1);
     rbtree_t *t = rb_create_pooled(mark_freed);
     if (!marks || !t) {
         fprintf(stderr, "    setup allocation failed\n");
@@ -216,7 +216,7 @@ static bool chain_destroy_small_stack(enum fixture_shape shape) {
         free(marks);
         return false;
     }
-    if (!fixture_build(t, shape, STRESS_N, marks)) {
+    if (!fixture_build(t, shape, stress_n, marks)) {
         fprintf(stderr, "    allocation failed while building the chain\n");
         rb_destroy(t);
         free(marks);
