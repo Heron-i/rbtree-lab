@@ -2,8 +2,9 @@
 
 > **Status:** plan approved (2026-10-11).
 > - **Increment 1:** done, in commit `cf4cf0e`.
-> - **Increment 2:** green under the full battery, awaiting review.
-> - **Increments 3-4:** not started.
+> - **Increment 2:** done, in commit `fe457f7`.
+> - **Increment 3:** green under `make test` + `make asan`, awaiting review.
+> - **Increment 4:** not started.
 >
 > This file is a copy of the approved plan. Increment 4 turns it into the final record with the test results.
 
@@ -167,10 +168,11 @@ Implementation in [src/rbtree.c](src/rbtree.c):
 Tests:
 - [tests/test_stress.c](tests/test_stress.c): add a foreach stage to RBM-01..03, on the same 64 KB thread **before** the destroy. It checks the count and strictly ascending order. RBM-02/03 go **red today**, because recursive foreach on a 10⁶ chain overflows.
 - [tests/test_foreach.c](tests/test_foreach.c), guards:
-  - **RBW-11:** a 4096-node left chain is visited in ascending order.
+  - **RBW-11:** 4096-node hand-built shapes are visited in ascending order. As built, this covers the left chain, the right chain (one 4095-level final climb) and the zigzag, not only the left chain.
   - **RBW-12:** zero `rb_malloc` calls, the `pool_stats` triple unchanged on pooled trees, and the stride-48 parent-cost check from `pool_geometry`.
   - **RBW-13:** a callback `longjmp`s out. The tree is still valid, and a re-walk is complete.
   - **RBW-14:** a nested foreach gives N×N calls in order.
+  - **The debug size assert has no committed test,** because a passing test can't survive the `abort`. It was checked once with a throwaway probe whose callback deletes a key mid-walk, and the assert fired.
 
 Implementation in [src/rbtree.c](src/rbtree.c):
 - Replace `rb_foreach_node` with the traversal core, `inorder_first` and `inorder_next`, each with its loop invariant and measure. `rb_foreach` is one `for` loop over them, with the contract comment and the `#ifndef NDEBUG` size assert (adds `<assert.h>`).

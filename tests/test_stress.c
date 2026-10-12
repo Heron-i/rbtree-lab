@@ -1,14 +1,16 @@
-// Purpose: Mutation 3 stack-bound proof. rb_destroy runs on a thread whose
-// whole stack is 64 KB, over trees of 2^20 (>= 10^6) nodes. Any recursion
-// (or explicit stack) proportional to tree height overflows there on the
-// hand-built chains, whose height is N; the iterative teardown needs only
-// a constant-size frame. All trees are pooled, which keeps building 10^6
-// nodes fast (one rb_malloc per 85 nodes instead of one per node).
+// Purpose: Mutation 3 stack-bound proof. rb_foreach and then rb_destroy run
+// on a thread whose whole stack is 64 KB, over trees of 2^20 (>= 10^6)
+// nodes. Any recursion (or explicit stack) proportional to tree height
+// overflows there on the hand-built chains, whose height is N; the
+// iterative walk and teardown need only constant-size frames. All trees
+// are pooled, which keeps building 10^6 nodes fast (one rb_malloc per 85
+// nodes instead of one per node).
 //   RBM-01: a real red-black tree built with rb_insert (stress test; its
 //           height is about 40, so it fits either way)
-//   RBM-02: a left chain (N - 1 teardown rotations)
-//   RBM-03: a right chain (no rotations)
-// Each checks that every value was freed exactly once.
+//   RBM-02: a left chain (walk descends N deep; N - 1 teardown rotations)
+//   RBM-03: a right chain (walk ends with one N - 1 level climb; no rotations)
+// Each checks the walk visited every key once, in order, with its own
+// value, and that every value was then freed exactly once.
 #include "rbtree.h"
 #include "../src/rbtree_internal.h"
 #include "../src/pool.h"
@@ -104,9 +106,38 @@ static bool all_marked_once(const unsigned char *marks, unsigned n) {
     return true;
 }
 
-/* ---- the 64 KB thread ---- */
-static void *destroy_body(void *tree) {
-    rb_destroy(tree);
+/* rb_foreach callback state: the walk must visit k0, k1, ... in order,
+ * each with its own value &marks[idx]. */
+struct walk_check {
+    const unsigned char *marks;
+    unsigned next;   /* index of the key the walk must visit next */
+    bool ok;
+};
+
+static void walk_check_cb(const char *key, void *value, void *ctx) {
+    struct walk_check *w = ctx;
+    char want[FIXTURE_KEY_LEN];
+    if (!w->ok) return;
+    snprintf(want, sizeof want, "k%07u", w->next);
+    if (w->next >= STRESS_N || strcmp(key, want) != 0 || value != &w->marks[w->next]) {
+        fprintf(stderr, "    walk position %u: got key \"%s\" (want \"%s\" with its own value)\n",
+                w->next, key, want);
+        w->ok = false;
+        return;
+    }
+    w->next++;
+}
+
+/* ---- the 64 KB thread: walk the whole tree, then tear it down ---- */
+struct stress_job {
+    rbtree_t *t;
+    struct walk_check walk;
+};
+
+static void *walk_then_destroy_body(void *arg) {
+    struct stress_job *job = arg;
+    rb_foreach(job->t, walk_check_cb, &job->walk);
+    rb_destroy(job->t);
     return NULL;
 }
 
@@ -127,12 +158,18 @@ static bool run_on_small_stack(void *(*body)(void *), void *arg) {
     return true;
 }
 
-/* Destroys t on the 64 KB thread, then checks each value was freed once.
- * Owns t and marks either way. */
+/* On the 64 KB thread, walks t (all STRESS_N keys in order) and then
+ * destroys it; afterwards checks each value was freed once. Owns t and
+ * marks either way. */
 static bool destroy_small_and_check(rbtree_t *t, unsigned char *marks) {
-    bool ok = run_on_small_stack(destroy_body, t);
+    struct stress_job job = {.t = t, .walk = {.marks = marks, .next = 0, .ok = true}};
+    bool ok = run_on_small_stack(walk_then_destroy_body, &job);
     if (!ok) rb_destroy(t);   /* thread never ran: release on this stack */
-    ok = ok && all_marked_once(marks, STRESS_N);
+    if (ok && job.walk.ok && job.walk.next != STRESS_N) {
+        fprintf(stderr, "    walk visited %u keys (want %u)\n", job.walk.next, STRESS_N);
+        job.walk.ok = false;
+    }
+    ok = ok && job.walk.ok && all_marked_once(marks, STRESS_N);
     free(marks);
     return ok;
 }
@@ -205,9 +242,9 @@ typedef struct {
 } test_case_t;
 
 static const test_case_t tests[] = {
-    {"RBM-01", "2^20-node RB tree destroyed on a 64 KB stack", test_rbm01_rbtree_destroy_small_stack},
-    {"RBM-02", "2^20-node left chain destroyed on a 64 KB stack", test_rbm02_left_chain_destroy_small_stack},
-    {"RBM-03", "2^20-node right chain destroyed on a 64 KB stack", test_rbm03_right_chain_destroy_small_stack},
+    {"RBM-01", "2^20-node RB tree walked + destroyed on a 64 KB stack", test_rbm01_rbtree_destroy_small_stack},
+    {"RBM-02", "2^20-node left chain walked + destroyed on a 64 KB stack", test_rbm02_left_chain_destroy_small_stack},
+    {"RBM-03", "2^20-node right chain walked + destroyed on a 64 KB stack", test_rbm03_right_chain_destroy_small_stack},
 };
 
 int main(void) {

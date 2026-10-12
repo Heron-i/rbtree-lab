@@ -14,8 +14,23 @@
 // Fixtures are built with rb_insert, now legitimate here since it has its
 // own independently-green test suite (tests/test_insert.c).
 // Implements RBW-01..RBW-10 from the rb_foreach test plan.
+// RBW-11..14 (Mutation 3) pin the iterative walk's contract:
+//   RBW-11 hand-built deep shapes (fixture_build below, via
+//          rbtree_internal.h) are walked in order;
+//   RBW-12 the walk allocates nothing and leaves pool_stats unchanged, and
+//          the parent pointer it climbs costs no pool slot;
+//   RBW-13 a callback that never returns (longjmp) leaves a valid tree;
+//   RBW-14 a nested rb_foreach from inside fn is safe.
+// RBW-13 is the one place rb_validate is used: a traversal that rewrote
+// links in place (Morris) could leave the tree corrupt, and that is
+// exactly what it checks. The 10^6-node, 64 KB-stack proof is
+// tests/test_stress.c.
 #include "rbtree.h"
+#include "../src/rbtree_internal.h"
+#include "../src/pool.h"
+#include "fault_alloc.h"
 
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -383,6 +398,285 @@ static bool test_rbw10_repeated_calls_are_idempotent(void) {
     return ok;
 }
 
+/* ---- Hand-built shapes (Mutation 3) ----
+ * Far deeper than any red-black tree: a chain of n nodes has height n.
+ * NOT red-black trees, so never rb_validate them. BST order ("k<idx>"
+ * sorts like idx) and parent links are correct. Node storage is whatever
+ * rb_destroy releases (t->pool if set, else rb_malloc), so the fixture
+ * also works in the pooled build. Same helper as tests/test_destroy.c. */
+#define FIXTURE_KEY_LEN 16
+
+enum fixture_shape { FIXTURE_LEFT_CHAIN, FIXTURE_RIGHT_CHAIN, FIXTURE_ZIGZAG };
+
+/* Links a new node (key "k<idx>", value) under parent as its left or right
+ * child; parent == &t->nil makes it the root. Returns the node, or NULL
+ * with nothing linked and nothing leaked if an allocation failed. */
+static struct rb_node *fixture_add(rbtree_t *t, struct rb_node *parent, bool as_left,
+                                   unsigned idx, void *value) {
+    char buf[FIXTURE_KEY_LEN];
+    snprintf(buf, sizeof buf, "k%07u", idx);
+    size_t len = strlen(buf) + 1;
+    char *key = rb_malloc(len);
+    if (key == NULL) return NULL;
+    struct rb_node *n = t->pool != NULL ? pool_alloc(t->pool) : rb_malloc(sizeof *n);
+    if (n == NULL) {
+        rb_free(key);
+        return NULL;
+    }
+    memcpy(key, buf, len);
+    n->key = key;
+    n->value = value;
+    n->left = n->right = &t->nil;
+    n->parent = parent;
+    n->color = BLACK;
+    if (parent == &t->nil) t->root = n;
+    else if (as_left) parent->left = n;
+    else parent->right = n;
+    t->size++;
+    return n;
+}
+
+/* Builds a one-path shape of n >= 1 nodes, keys k0..k(n-1); node k<idx>
+ * gets value &marks[idx] (NULL if marks is NULL). Returns false if an
+ * allocation failed; nodes linked so far stay in t for rb_destroy.
+ *   LEFT_CHAIN:  every node is its parent's left child; root holds k(n-1).
+ *   RIGHT_CHAIN: every node is its parent's right child; root holds k0.
+ *   ZIGZAG:      root holds the largest key, its left child the smallest,
+ *                that node's right child the next-largest, and so on. */
+static bool fixture_build(rbtree_t *t, enum fixture_shape shape, unsigned n,
+                          unsigned char *marks) {
+    unsigned lo = 0, hi = n - 1;
+    bool take_hi = shape != FIXTURE_RIGHT_CHAIN;
+    bool as_left = shape != FIXTURE_RIGHT_CHAIN;
+    struct rb_node *tail = &t->nil;
+    /* invariant: keys lo..hi are unbuilt, and all belong in tail's next child slot */
+    for (unsigned d = 0; d < n; d++) {
+        unsigned idx = take_hi ? hi-- : lo++;
+        tail = fixture_add(t, tail, as_left, idx, marks != NULL ? &marks[idx] : NULL);
+        if (tail == NULL) return false;
+        if (shape == FIXTURE_ZIGZAG) {
+            as_left = take_hi;   /* below a high key go left, below a low key go right */
+            take_hi = !take_hi;
+        }
+    }
+    return true;
+}
+
+#define SHAPE_N 4096u
+/* value identity for keys k0..k(SHAPE_N-1): key k<idx> holds &marks[idx] */
+static unsigned char marks[SHAPE_N];
+
+static bool key_is(const char *key, unsigned idx) {
+    char want[FIXTURE_KEY_LEN];
+    snprintf(want, sizeof want, "k%07u", idx);
+    return strcmp(key, want) == 0;
+}
+
+/* Callback state: the walk must visit k0..k(n-1) in order, each with &marks[idx]. */
+struct walk_check {
+    unsigned n;
+    unsigned next;   /* index of the key the walk must visit next */
+    bool ok;
+};
+
+static void walk_check_cb(const char *key, void *value, void *ctx) {
+    struct walk_check *w = ctx;
+    if (!w->ok) return;
+    if (w->next >= w->n || !key_is(key, w->next) || value != &marks[w->next]) {
+        fprintf(stderr, "    walk position %u: got key \"%s\" (want k%07u with its own value)\n",
+                w->next, key, w->next);
+        w->ok = false;
+        return;
+    }
+    w->next++;
+}
+
+/* True iff rb_foreach visits exactly k0..k(n-1), in order, with their values. */
+static bool walk_in_order(const rbtree_t *t, unsigned n, const char *what) {
+    struct walk_check w = {.n = n, .next = 0, .ok = true};
+    rb_foreach(t, walk_check_cb, &w);
+    if (w.ok && w.next != n) {
+        fprintf(stderr, "    %s: walk visited %u keys (want %u)\n", what, w.next, n);
+        w.ok = false;
+    }
+    return w.ok;
+}
+
+/* A real red-black tree of keys k0..k(n-1) (n <= SHAPE_N), inserted in
+ * descending order, key k<idx> holding &marks[idx]. NULL on failure. */
+static rbtree_t *build_inserted(unsigned n) {
+    rbtree_t *t = rb_create(NULL);
+    if (!t) {
+        fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
+        return NULL;
+    }
+    char key[FIXTURE_KEY_LEN];
+    /* invariant: keys k(i+1)..k(n-1) are in t */
+    for (unsigned i = n; i-- > 0;) {
+        snprintf(key, sizeof key, "k%07u", i);
+        if (rb_insert(t, key, &marks[i]) != 0) {
+            fprintf(stderr, "    rb_insert(\"%s\") failed while building the tree\n", key);
+            rb_destroy(t);
+            return NULL;
+        }
+    }
+    return t;
+}
+
+/* ---- RBW-11: hand-built 4096-deep shapes are walked in order ----
+ * Left chain: one 4095-deep descent, then a one-level climb per node.
+ * Right chain: no climb until the end, then one 4095-level climb.
+ * Zigzag: low keys are reached by short descents, high keys by climbs
+ * back up through the low keys. */
+static bool test_rbw11_hand_built_shapes_in_order(void) {
+    const enum fixture_shape shapes[] = {FIXTURE_LEFT_CHAIN, FIXTURE_RIGHT_CHAIN, FIXTURE_ZIGZAG};
+    const char *names[] = {"left chain", "right chain", "zigzag"};
+    /* invariant: every shape before s was walked in order */
+    for (size_t s = 0; s < sizeof shapes / sizeof shapes[0]; s++) {
+        rbtree_t *t = rb_create(NULL);
+        if (!t) {
+            fprintf(stderr, "    rb_create(NULL) returned NULL, cannot build tree\n");
+            return false;
+        }
+        bool ok = fixture_build(t, shapes[s], SHAPE_N, marks);
+        if (!ok) fprintf(stderr, "    %s: allocation failed while building\n", names[s]);
+        ok = ok && walk_in_order(t, SHAPE_N, names[s]);
+        rb_destroy(t);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/* ---- RBW-12: the walk allocates nothing, leaves pool_stats unchanged,
+ * and the parent pointer it climbs costs no pool slot ---- */
+static bool test_rbw12_walk_allocates_nothing(void) {
+    /* the node as it is, and the same node minus its parent pointer */
+    struct pool_geom with_parent, without_parent;
+    if (pool_geometry(sizeof(struct rb_node), &with_parent) != 0 ||
+        pool_geometry(sizeof(struct rb_node) - sizeof(struct rb_node *), &without_parent) != 0) {
+        fprintf(stderr, "    pool_geometry rejected the node size\n");
+        return false;
+    }
+    if (with_parent.stride != without_parent.stride ||
+        with_parent.objs_per_slab != without_parent.objs_per_slab) {
+        fprintf(stderr,
+                "    parent pointer costs pool space: stride %zu vs %zu, %zu vs %zu objs/slab\n",
+                with_parent.stride, without_parent.stride, with_parent.objs_per_slab,
+                without_parent.objs_per_slab);
+        return false;
+    }
+    rbtree_t *t = build_inserted(SHAPE_N);
+    if (!t) return false;
+    size_t slabs0 = 0, live0 = 0, free0 = 0, slabs1 = 0, live1 = 0, free1 = 0;
+    if (t->pool != NULL) pool_stats(t->pool, &slabs0, &live0, &free0);
+    long before = fault_alloc_total();
+    bool ok = walk_in_order(t, SHAPE_N, "inserted tree");
+    long made = fault_alloc_total() - before;
+    if (t->pool != NULL) pool_stats(t->pool, &slabs1, &live1, &free1);
+    if (made != 0) {
+        fprintf(stderr, "    rb_foreach made %ld rb_malloc calls (want 0)\n", made);
+        ok = false;
+    }
+    if (slabs0 != slabs1 || live0 != live1 || free0 != free1) {
+        fprintf(stderr, "    pool_stats changed across rb_foreach: (%zu,%zu,%zu) -> (%zu,%zu,%zu)\n",
+                slabs0, live0, free0, slabs1, live1, free1);
+        ok = false;
+    }
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBW-13: a callback that never returns (longjmp) leaves the tree
+ * valid, the same size, and fully walkable again ---- */
+static jmp_buf escape_point;
+
+struct escape_ctx {
+    unsigned calls;
+    unsigned stop_after;
+};
+
+static void escape_cb(const char *key, void *value, void *ctx) {
+    (void)key;
+    (void)value;
+    struct escape_ctx *e = ctx;
+    if (++e->calls == e->stop_after) longjmp(escape_point, 1);
+}
+
+static bool test_rbw13_longjmp_out_leaves_valid_tree(void) {
+    rbtree_t *t = build_inserted(SHAPE_N);
+    if (!t) return false;
+    struct escape_ctx e = {.calls = 0, .stop_after = SHAPE_N / 2};
+    if (setjmp(escape_point) == 0) {
+        rb_foreach(t, escape_cb, &e);
+        fprintf(stderr, "    rb_foreach returned; the callback never escaped\n");
+        rb_destroy(t);
+        return false;
+    }
+    bool ok = true;
+    if (rb_validate(t) != 0 || rb_size(t) != SHAPE_N) {
+        fprintf(stderr, "    after escape: rb_validate=%d (want 0), rb_size=%zu (want %u)\n",
+                rb_validate(t), rb_size(t), SHAPE_N);
+        ok = false;
+    }
+    ok = ok && walk_in_order(t, SHAPE_N, "walk after escape");
+    rb_destroy(t);
+    return ok;
+}
+
+/* ---- RBW-14: rb_foreach from inside fn (read-only reentrancy) ---- */
+#define NESTED_N 64u
+
+struct nested_ctx {
+    const rbtree_t *t;
+    unsigned outer_next;   /* key the outer walk must visit next */
+    unsigned inner_next;   /* key the current inner walk must visit next */
+    unsigned long calls;   /* inner callbacks so far */
+    bool ok;
+};
+
+static void inner_cb(const char *key, void *value, void *ctx) {
+    (void)value;
+    struct nested_ctx *c = ctx;
+    if (c->ok && !key_is(key, c->inner_next)) {
+        fprintf(stderr, "    inner walk under k%07u: got \"%s\" (want k%07u)\n", c->outer_next,
+                key, c->inner_next);
+        c->ok = false;
+    }
+    c->inner_next++;
+    c->calls++;
+}
+
+static void outer_cb(const char *key, void *value, void *ctx) {
+    (void)value;
+    struct nested_ctx *c = ctx;
+    if (c->ok && !key_is(key, c->outer_next)) {
+        fprintf(stderr, "    outer walk: got \"%s\" (want k%07u)\n", key, c->outer_next);
+        c->ok = false;
+    }
+    c->inner_next = 0;
+    rb_foreach(c->t, inner_cb, c);
+    if (c->ok && c->inner_next != NESTED_N) {
+        fprintf(stderr, "    inner walk under k%07u visited %u keys (want %u)\n", c->outer_next,
+                c->inner_next, NESTED_N);
+        c->ok = false;
+    }
+    c->outer_next++;
+}
+
+static bool test_rbw14_nested_foreach(void) {
+    rbtree_t *t = build_inserted(NESTED_N);
+    if (!t) return false;
+    struct nested_ctx c = {.t = t, .outer_next = 0, .inner_next = 0, .calls = 0, .ok = true};
+    rb_foreach(t, outer_cb, &c);
+    if (c.ok && (c.outer_next != NESTED_N || c.calls != (unsigned long)NESTED_N * NESTED_N)) {
+        fprintf(stderr, "    nested walk: %u outer, %lu inner calls (want %u, %lu)\n",
+                c.outer_next, c.calls, NESTED_N, (unsigned long)NESTED_N * NESTED_N);
+        c.ok = false;
+    }
+    rb_destroy(t);
+    return c.ok;
+}
+
 typedef struct {
     const char *id;
     const char *name;
@@ -407,6 +701,13 @@ static const test_case_t tests[] = {
      test_rbw09_overwrite_appears_once},
     {"RBW-10", "repeated foreach calls on an unmodified tree are idempotent",
      test_rbw10_repeated_calls_are_idempotent},
+    {"RBW-11", "hand-built 4096-deep shapes are walked in order",
+     test_rbw11_hand_built_shapes_in_order},
+    {"RBW-12", "the walk allocates nothing; parent costs no pool slot",
+     test_rbw12_walk_allocates_nothing},
+    {"RBW-13", "a callback that longjmps out leaves a valid tree",
+     test_rbw13_longjmp_out_leaves_valid_tree},
+    {"RBW-14", "rb_foreach nested inside fn is safe", test_rbw14_nested_foreach},
 };
 
 int main(void) {

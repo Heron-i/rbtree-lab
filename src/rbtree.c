@@ -3,6 +3,7 @@
 #include "rbtree_internal.h"
 #include "fault_alloc.h"   /* rb_malloc/rb_free: the only allocation seam */
 #include "pool.h"          /* slab pool behind rb_create_pooled */
+#include <assert.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -461,17 +462,61 @@ int rb_delete(rbtree_t *t, const char *key) {
     return 0;
 }
 
-static void rb_foreach_node(const struct rbtree *t, const struct rb_node *n,
-                             void (*fn)(const char *key, void *value, void *ctx), void *ctx) {
-    if (n == &t->nil) return;          /* base case: sentinel marks "no node" */
-    rb_foreach_node(t, n->left, fn, ctx);
-    fn(n->key, n->value, ctx);
-    rb_foreach_node(t, n->right, fn, ctx);
+/* Traversal core (Mutation 3), part 1: t's in-order first node, or &t->nil
+ * if t is empty. The const counterpart of tree_minimum; the empty check
+ * matters, because the sentinel's left link points back at itself. */
+static const struct rb_node *inorder_first(const struct rbtree *t) {
+    const struct rb_node *n = t->root;
+    if (n == &t->nil) return n;
+    /* invariant: the minimum lies in n's subtree; measure: that subtree's height */
+    while (n->left != &t->nil) n = n->left;
+    return n;
 }
 
+/* Traversal core, part 2: n's in-order successor, or &t->nil after the
+ * last node. The way back up is read from the nodes' own parent links,
+ * not kept on a stack; nothing is written. */
+static const struct rb_node *inorder_next(const struct rbtree *t, const struct rb_node *n) {
+    if (n->right != &t->nil) {
+        n = n->right;
+        /* invariant: the successor lies in n's subtree; measure: that subtree's height */
+        while (n->left != &t->nil) n = n->left;
+        return n;
+    }
+    const struct rb_node *p = n->parent;
+    /* invariant: n's whole subtree is visited; measure: n's depth, which
+     * bottoms out at the root, whose parent is the sentinel */
+    while (p != &t->nil && n == p->right) {
+        n = p;
+        p = p->parent;
+    }
+    return p;
+}
+
+/* In-order, O(1) auxiliary space, no recursion: the state is one node
+ * pointer here plus the tree's existing parent links.
+ * Contract:
+ *   - Every entry is passed to fn exactly once, in strictly ascending
+ *     strcmp order.
+ *   - fn may call read-only operations on t (rb_find, rb_size,
+ *     rb_validate, a nested rb_foreach) and may change what *value points to.
+ *   - fn must not rb_insert, rb_delete or rb_destroy on t (undefined;
+ *     debug builds assert that t's size is unchanged after each call).
+ *     t and fn must be non-NULL.
+ *   - If fn never returns (loops, longjmps, exits), t is still valid: the
+ *     walk never writes to the tree and holds nothing. There is no
+ *     cursor, so a walk cannot be resumed, only restarted. */
 void rb_foreach(const rbtree_t *t, void (*fn)(const char *key, void *value, void *ctx),
                  void *ctx) {
-    rb_foreach_node(t, t->root, fn, ctx);
+    /* invariant: every key before n's went to fn exactly once, none after;
+     * measure: nodes not yet visited, which drops by exactly 1 per pass */
+    for (const struct rb_node *n = inorder_first(t); n != &t->nil; n = inorder_next(t, n)) {
+#ifndef NDEBUG
+        size_t size_before = t->size;
+#endif
+        fn(n->key, n->value, ctx);
+        assert(t->size == size_before && "rb_foreach callback inserted or deleted a key");
+    }
 }
 
 
