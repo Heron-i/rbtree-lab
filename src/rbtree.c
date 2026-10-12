@@ -505,7 +505,12 @@ static const struct rb_node *inorder_next(const struct rbtree *t, const struct r
  *     t and fn must be non-NULL.
  *   - If fn never returns (loops, longjmps, exits), t is still valid: the
  *     walk never writes to the tree and holds nothing. There is no
- *     cursor, so a walk cannot be resumed, only restarted. */
+ *     cursor, so a walk cannot be resumed, only restarted.
+ *   - const: the frozen header passes t as const rbtree_t *, and the walk
+ *     keeps that promise because it only reads child and parent links.
+ *     Morris traversal would instead have to cast const away to rewire
+ *     right links in place, and a callback that never returns would leave
+ *     those rewired links (cycles) behind. */
 void rb_foreach(const rbtree_t *t, void (*fn)(const char *key, void *value, void *ctx),
                  void *ctx) {
     /* invariant: every key before n's went to fn exactly once, none after;

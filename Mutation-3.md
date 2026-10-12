@@ -7,8 +7,8 @@
 > - **Increment 4:** this file finalized as the record, plus the final battery (docs only).
 >
 > A check against the spec on 2026-10-12 found three gaps, which are being closed as small diffs:
-> - **Increment 5:** the big stress case behind `--big`. Green, awaiting review.
-> - **Increment 6:** the `const` wording in the `rb_foreach` contract. Not started.
+> - **Increment 5:** the big stress case behind `--big`, commit `8bc01dc`.
+> - **Increment 6:** the `const` wording in the `rb_foreach` contract. Green, awaiting review.
 > - **Increment 7:** final status update. Not started.
 > - The spec's "account for the cost in your reflection" item is covered in `REFLECTION.md`, which you write, so it isn't an increment here.
 >
@@ -220,7 +220,7 @@ Checking the finished work against the spec's wording found three items that wer
 
 Each is closed by one small reviewed diff, using the same cycle as above.
 
-### Increment 5: big stress case behind `--big`. Green, awaiting review
+### Increment 5: big stress case behind `--big`. Commit `8bc01dc`
 - **You decided:**
   - `test_stress` runs N = 2¹⁴ = 16,384 by default, and `--big` runs the 2²⁰ (≥10⁶) case.
   - `make test` and `make asan` always pass `--big`.
@@ -241,9 +241,10 @@ Each is closed by one small reviewed diff, using the same cycle as above.
   - `make asan`: exit 0, the same 204 PASS, 0 FAIL, and no sanitizer reports, also at N = 1048576.
   - `make clean && make memcheck`: exit 0. All 25 valgrind runs report 0 errors with all heap blocks freed, and `test_stress` ran at N = 16384. The total time was **53 s**, down from 1 min 20 s.
 
-### Increment 6: `const` wording in the `rb_foreach` contract. Not started
-- **Plan:** add one sentence to the contract comment above `rb_foreach` in [src/rbtree.c](src/rbtree.c). It will say that the walk honors the header's `const rbtree_t *` because it only reads links, and that Morris traversal would have to cast `const` away to rewrite `right` links.
-- **Scope:** a comment only, so no behavior changes and no new tests. `make test` and `make asan` confirm the build stays clean.
+### Increment 6: `const` wording in the `rb_foreach` contract. Green, awaiting review
+- [src/rbtree.c](src/rbtree.c): the contract comment above `rb_foreach` gains a `const` bullet. It says that the frozen header passes `t` as `const rbtree_t *`, and that the walk keeps that promise because it only reads child and parent links. Morris traversal would have to cast `const` away to rewire `right` links in place, and a callback that never returns would leave those rewired links, as cycles, behind.
+- **Scope:** a comment only, so no behavior changes and no new tests. There is no red step, because nothing here can fail a test.
+- **Battery:** `make test` and `make asan` both exited 0, with 204 PASS, 0 FAIL, no sanitizer reports and no compiler warnings. Memcheck was not run, because nothing it checks changed.
 
 ### Increment 7: final status update. Not started
 - **Plan:** once Increments 5 and 6 are committed, mark them done with their commits in the status block and here.
