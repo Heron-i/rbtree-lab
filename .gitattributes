@@ -1,0 +1,5 @@
+# Store and check out every text file with LF endings; git detects binaries.
+* text=auto eol=lf
+
+# Graded contract: never modified, so git must not convert it either.
+include/rbtree.h -text
