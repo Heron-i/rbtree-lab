@@ -9,6 +9,9 @@
 // rb_create_pooled, and after EVERY op the pool's own stats must satisfy
 //     live + free_objs == slabs * objs_per_slab   and   live == model count
 // (read through the internal headers). The default mode is unchanged.
+// Mutation 3: every validation also checks parent links (root->parent is
+// the sentinel, each child names its parent), the precondition of
+// rb_foreach's parent-pointer walk.
 #include "rbtree.h"
 #include "../src/rbtree_internal.h"
 #include "../src/pool.h"
@@ -198,9 +201,26 @@ static bool check_pool(const rbtree_t *t, size_t model_count, unsigned long op_i
     return true;
 }
 
+/* M3: rb_foreach climbs parent links, which rb_validate does not check.
+ * Every child of n must name n as its parent. Depth is bounded by RB height. */
+static bool parent_links_ok(const rbtree_t *t, const struct rb_node *n) {
+    if (n == &t->nil) return true;
+    if (n->left != &t->nil && n->left->parent != n) return false;
+    if (n->right != &t->nil && n->right->parent != n) return false;
+    return parent_links_ok(t, n->left) && parent_links_ok(t, n->right);
+}
+
 static bool run_validate(rbtree_t *t, unsigned long op_index) {
     if (rb_validate(t) != 0) {
         fprintf(stderr, "fuzz: rb_validate failed at op %lu\n", op_index);
+        return false;
+    }
+    if (t->root != &t->nil && t->root->parent != &t->nil) {
+        fprintf(stderr, "fuzz: root's parent is not the sentinel at op %lu\n", op_index);
+        return false;
+    }
+    if (!parent_links_ok(t, t->root)) {
+        fprintf(stderr, "fuzz: broken parent link at op %lu\n", op_index);
         return false;
     }
     return true;
