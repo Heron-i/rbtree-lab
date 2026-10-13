@@ -1,6 +1,6 @@
 # Lily's Developer Log for the rbtree-lab
 
-NOTE: This document's current additions (9/5) mark the transition from my handwritten notes started on 9/1 (either directly from the HW1 pdfs themselves or logs made overtime from the process of reading them).
+NOTE: This document's current additions (9/5) mark the transition from my handwritten notes started on 9/1 (either directly from the HW1 pdfs themselves or logs made overtime from the process of reading them). Additionally, DEVLOGs missing for October '26 were moved to individual markdown files per mutation rather than per day.
 
 ## 2026-09-01 (evening 1)
 STATE: Untouched code base
