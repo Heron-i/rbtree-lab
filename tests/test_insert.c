@@ -21,7 +21,8 @@
 // and key copy, swaps in the new value, and releases only the old value.
 // RBI-16 checks the no-allocation rule for an overwrite with a new value;
 // RBI-17 checks it for an overwrite with the SAME value pointer, and also
-// that the tree does not release a value it still owns. Deferred: a
+// that the old value is still released exactly once, as rbtree.h says of
+// every overwrite (free_recorder frees nothing, so no dangling). Deferred: a
 // mirrored recolor case and a fixed shuffled-order stress case.
 // RBI-06P/07P/15P/16P/17P (M5 Mutation 2) are pooled twins of the five
 // allocation-failure tests. A pooled new-key insert allocates the key copy
@@ -657,9 +658,10 @@ static bool test_rbi16_overwrite_does_not_allocate(void) {
  * Two rules, both checked:
  *   1. Overwrite MUST NOT ALLOCATE: zero rb_malloc calls, so it succeeds
  *      even with the next allocation armed to fail (fault_alloc_arm(1)).
- *   2. The tree must not release that value: on success the tree owns it,
- *      so value_free(old) would leave the tree holding a dangling pointer. ---- */
-static bool test_rbi17_reinsert_same_value_not_freed(void) {
+ *   2. rbtree.h: "Overwriting an existing key frees the old value via
+ *      value_free" -- no same-pointer exception, so value_free runs exactly
+ *      once, on that pointer. ---- */
+static bool test_rbi17_reinsert_same_value_freed_once(void) {
     rbtree_t *t = rb_create(free_recorder);
     if (!t) {
         fprintf(stderr, "    rb_create(free_recorder) returned NULL, cannot build tree\n");
@@ -677,12 +679,13 @@ static bool test_rbi17_reinsert_same_value_not_freed(void) {
     int rc = rb_insert(t, "10", &tag);
     long allocs = fault_alloc_total() - allocs_before;
     fault_alloc_disarm();
-    bool ok = (rc == 0) && (allocs == 0) && (free_recorder_count == 0) &&
+    bool ok = (rc == 0) && (allocs == 0) && (free_recorder_count == 1) &&
+              free_recorder_saw(&tag) &&
               (rb_find(t, "10") == &tag) && (rb_size(t) == 1) && (rb_validate(t) == 0);
     if (!ok) {
         fprintf(stderr,
                 "    re-insert \"10\" with its own value under fault_alloc_arm(1): rc=%d (want 0), "
-                "allocations=%ld (want 0), value_free calls=%d (want 0), "
+                "allocations=%ld (want 0), value_free calls=%d (want 1, of &tag), "
                 "find returns same value=%d, size=%zu (want 1)\n",
                 rc, allocs, free_recorder_count, rb_find(t, "10") == &tag, rb_size(t));
     }
@@ -885,8 +888,9 @@ static bool test_rbi16p_pooled_overwrite_does_not_allocate(void) {
 }
 
 /* ---- RBI-17P: pooled twin of RBI-17. Same-pointer re-insert allocates
- * nothing, releases nothing, and leaves the pool untouched ---- */
-static bool test_rbi17p_pooled_reinsert_same_value_not_freed(void) {
+ * nothing, releases the old value exactly once, and leaves the pool
+ * untouched ---- */
+static bool test_rbi17p_pooled_reinsert_same_value_freed_once(void) {
     rbtree_t *t = rb_create_pooled(free_recorder);
     if (!t) {
         fprintf(stderr, "    rb_create_pooled(free_recorder) returned NULL, cannot build tree\n");
@@ -906,13 +910,14 @@ static bool test_rbi17p_pooled_reinsert_same_value_not_freed(void) {
     long allocs = fault_alloc_total() - allocs_before;
     fault_alloc_disarm();
     struct triple stats_after = pool_triple(t);
-    bool ok = (rc == 0) && (allocs == 0) && (free_recorder_count == 0) &&
+    bool ok = (rc == 0) && (allocs == 0) && (free_recorder_count == 1) &&
+              free_recorder_saw(&tag) &&
               (rb_find(t, "10") == &tag) && (rb_size(t) == 1) && (rb_validate(t) == 0) &&
               triple_eq(stats_after, stats_before);
     if (!ok) {
         fprintf(stderr,
                 "    pooled re-insert \"10\" with its own value under fault_alloc_arm(1): rc=%d "
-                "(want 0), allocations=%ld (want 0), value_free calls=%d (want 0), "
+                "(want 0), allocations=%ld (want 0), value_free calls=%d (want 1, of &tag), "
                 "find returns same value=%d, size=%zu (want 1), stats unchanged=%d\n",
                 rc, allocs, free_recorder_count, rb_find(t, "10") == &tag, rb_size(t),
                 triple_eq(stats_after, stats_before));
@@ -948,8 +953,8 @@ static const test_case_t tests[] = {
     {"RBI-15", "key-copy allocation failure leaves the tree unchanged",
      test_rbi15_key_copy_alloc_failure},
     {"RBI-16", "overwrite performs no allocation", test_rbi16_overwrite_does_not_allocate},
-    {"RBI-17", "re-insert with the same value pointer does not free it",
-     test_rbi17_reinsert_same_value_not_freed},
+    {"RBI-17", "re-insert with the same value pointer frees the old value once",
+     test_rbi17_reinsert_same_value_freed_once},
     {"RBI-06P", "pooled: key-copy failure on an empty tree",
      test_rbi06p_pooled_alloc_failure_empty_tree},
     {"RBI-07P", "pooled: key-copy failure leaves tree and pool unchanged",
@@ -958,8 +963,8 @@ static const test_case_t tests[] = {
      test_rbi15p_pooled_slab_alloc_failure},
     {"RBI-16P", "pooled: overwrite performs no allocation",
      test_rbi16p_pooled_overwrite_does_not_allocate},
-    {"RBI-17P", "pooled: same-pointer re-insert does not free it",
-     test_rbi17p_pooled_reinsert_same_value_not_freed},
+    {"RBI-17P", "pooled: same-pointer re-insert frees the old value once",
+     test_rbi17p_pooled_reinsert_same_value_freed_once},
 };
 
 int main(void) {

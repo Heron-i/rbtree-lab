@@ -4,15 +4,17 @@
 // scenarios are swept:
 //   A: insert 200 keys, then delete 100, then overwrite 50 (the spec's).
 //   B: 50 interleaved rounds of {insert 4 new keys, delete one, overwrite
-//      one, re-insert one with its SAME value pointer}, so faults land on
-//      trees reshaped by delete_fixup and every delete/overwrite also runs
-//      on trees that survived a failed insert.
+//      one}, so faults land on trees reshaped by delete_fixup and every
+//      delete/overwrite also runs on trees that survived a failed insert.
+//      No same-pointer re-insert: per rbtree.h an overwrite always frees the
+//      old value, so re-inserting a value the tree owns is caller misuse
+//      (RBI-17/RBI-17P count that callback with a non-freeing recorder).
 // Failure rule (both scenarios): only a new-key insert allocates, exactly
 // twice (node, then key copy). With rel = allocations so far this run, the
 // insert must fail iff rel < n <= rel+2 -- at the node if n == rel+1, at
 // the key copy if n == rel+2 -- and must leave the tree exactly as it was
 // (assert_unchanged) without consuming the caller's value (counting_free).
-// Delete, overwrite and same-pointer re-insert must never allocate: each
+// Delete and overwrite must never allocate: each
 // runs under a live fault, must free exactly the right value (by serial),
 // and every value_free callback must see a fully consistent tree.
 // Pooled runs (M5 Mutation 2): A and B are swept a second time on a tree
@@ -23,8 +25,8 @@
 // where k = 2 if free_objs == 0 before the insert, else 1 -- at the key copy
 // if n == rel+1, at the slab if n == rel+2. Through the internal headers,
 // pooled runs also assert after every op that live + free_objs ==
-// slabs * objs_per_slab and live == rb_size, that a failed insert,
-// overwrite or same-pointer re-insert leaves the stats triple unchanged,
+// slabs * objs_per_slab and live == rb_size, that a failed insert or an
+// overwrite leaves the stats triple unchanged,
 // and that a delete is exactly live-1, free+1.
 #include "rbtree.h"
 #include "../src/rbtree_internal.h"
@@ -216,7 +218,7 @@ static bool self_test_assert_unchanged(void) {
 }
 
 /* ---- scenarios: fixed op lists over the key universe ---- */
-enum op_kind { OP_INSERT, OP_DELETE, OP_OVERWRITE, OP_REINSERT_SAME };
+enum op_kind { OP_INSERT, OP_DELETE, OP_OVERWRITE };
 
 struct op {
     enum op_kind kind;
@@ -261,7 +263,6 @@ static void build_scenario_b(struct scenario *s) {
         int prev = PER_ROUND * (r - 1);   /* first key of the previous round */
         push_op(s, OP_DELETE, perm(prev));
         push_op(s, OP_OVERWRITE, perm(prev + 1));
-        push_op(s, OP_REINSERT_SAME, perm(prev + 2));
     }
 }
 
@@ -306,7 +307,7 @@ struct run_ctx {
     struct run_result r;
 };
 
-/* A delete/overwrite/re-insert must not allocate, so it always runs under a
+/* A delete/overwrite must not allocate, so it always runs under a
  * live fault: the run's own fault if still pending, else a fresh arm(1). */
 static bool live_fault_begin(const struct run_ctx *c) {
     bool pending = fault_alloc_total() - c->t0 < c->n;
@@ -464,30 +465,6 @@ static void do_overwrite(struct run_ctx *c, int id, const char *key) {
     c->m.val[id] = v;
 }
 
-static void do_reinsert_same(struct run_ctx *c, const char *key, struct tval *v) {
-    long a0 = fault_alloc_total(), f0 = g_freed, b0 = g_bad_callbacks;
-    struct triple st0 = c->pooled ? triple_of(c->t) : (struct triple){0};
-
-    bool pending = live_fault_begin(c);
-    g_check_tree = c->t;
-    int rc = rb_insert(c->t, key, v);
-    g_check_tree = NULL;
-    live_fault_end(pending);
-
-    if (rc != 0 || fault_alloc_total() != a0 || g_freed != f0 ||
-        rb_find(c->t, key) != v || g_bad_callbacks != b0) {
-        fprintf(stderr, "    n=%ld: same-pointer re-insert of \"%s\" rc=%d allocs=%ld "
-                "freed=%ld (want 0, 0, 0): the tree released a value it owns\n",
-                c->n, key, rc, fault_alloc_total() - a0, g_freed - f0);
-        fail(c);
-    }
-    if (c->pooled && !triple_eq(triple_of(c->t), st0)) {
-        fprintf(stderr, "    n=%ld: same-pointer re-insert of \"%s\" changed the pool stats\n",
-                c->n, key);
-        fail(c);
-    }
-}
-
 /* Pooled only, after every op: every slot is live, free-listed or uncarved,
  * and the live slots are exactly the tree's nodes. */
 static void check_pool_after_op(struct run_ctx *c, size_t op) {
@@ -547,9 +524,6 @@ static struct run_result run_scenario(const struct scenario *s, long n) {
             /* a key whose insert failed earlier is absent: plain insert */
             if (cur != NULL) do_overwrite(&c, id, key);
             else do_new_insert(&c, id, key);
-            break;
-        case OP_REINSERT_SAME:
-            if (cur != NULL) do_reinsert_same(&c, key, cur);
             break;
         }
         if (c.pooled) check_pool_after_op(&c, i);

@@ -289,8 +289,8 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
         if (cmp == 0) {
             void *old_value = cur->value;
             cur->value = value;
-            /* same pointer: the tree already owns it, nothing to release */
-            if (t->value_free != NULL && old_value != value) t->value_free(old_value);
+            /* rbtree.h: an overwrite frees the old value, even if it is the same pointer */
+            if (t->value_free != NULL) t->value_free(old_value);
             return 0;
         }
         parent = cur;
